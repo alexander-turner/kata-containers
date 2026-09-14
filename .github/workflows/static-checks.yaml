@@ -25,7 +25,7 @@ jobs:
     name: check-kernel-config-version
     needs: skipper
     if: ${{ needs.skipper.outputs.skip_static != 'yes' }}
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - name: Checkout the code
@@ -53,11 +53,11 @@ jobs:
     if: ${{ needs.skipper.outputs.skip_static != 'yes' }}
     uses: ./.github/workflows/build-checks.yaml
     with:
-      instance: ubuntu-22.04
+      instance: ubuntu-24.04
 
   build-checks-depending-on-kvm:
     name: build-checks-depending-on-kvm
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     timeout-minutes: 130
     needs: skipper
     if: ${{ needs.skipper.outputs.skip_static != 'yes' }}
@@ -102,7 +102,7 @@ jobs:
 
   kata-deploy-binary-build-check:
     name: kata-deploy-binary-build-check
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     needs: skipper
     if: ${{ needs.skipper.outputs.skip_static != 'yes' }}
@@ -127,7 +127,7 @@ jobs:
 
   static-checks:
     name: static-checks
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     needs: skipper
     if: ${{ needs.skipper.outputs.skip_static != 'yes' }}
@@ -192,7 +192,7 @@ jobs:
 
   codegen:
     name: codegen
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     needs: skipper
     if: ${{ needs.skipper.outputs.skip_static != 'yes' }}
@@ -227,7 +227,7 @@ jobs:
 
   go-mod-tidy:
     name: go-mod-tidy
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     needs: skipper
     if: ${{ needs.skipper.outputs.skip_static != 'yes' }}
@@ -304,7 +304,7 @@ jobs:
     name: check-agent-policy-coverage
     needs: skipper
     if: ${{ needs.skipper.outputs.skip_static != 'yes' }}
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - name: Checkout the code
@@ -319,7 +319,7 @@ jobs:
     name: check-broken-symlinks
     needs: skipper
     if: ${{ needs.skipper.outputs.skip_static != 'yes' }}
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - name: Checkout the code
