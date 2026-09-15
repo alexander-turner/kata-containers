@@ -23,6 +23,16 @@
 HELM_RELEASE_NAME="${HELM_RELEASE_NAME:-kata-deploy}"
 HELM_NAMESPACE="${HELM_NAMESPACE:-kube-system}"
 
+# As the /host mount sees them, not as the install logs them. A node uses one,
+# so the rest are absent, and none reaches a datastore matching handler names.
+containerd_config_roots() {
+	echo "/host/etc/containerd \
+/host/etc/k0s \
+/host/var/lib/rancher/k3s/agent/etc/containerd \
+/host/var/lib/rancher/rke2/agent/etc/containerd \
+/host/var/snap/microk8s/current/args"
+}
+
 # Run a command against the host node's filesystem, mounted at /host inside a
 # short-lived privileged pod.
 # Usage: run_on_host "test -d /host/opt/kata && echo YES || echo NO"
