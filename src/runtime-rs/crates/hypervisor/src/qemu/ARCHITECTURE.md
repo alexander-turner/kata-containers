@@ -461,7 +461,7 @@ pub fn with_hugepages(mut self, path: &str) -> Self {
         prealloc: true,
         share: true,
     });
-    self.machine.set_memory_backend(&id);  // -machine memory-backend=m0
+    self.machine.set_memory_backend(&id);  // omitted at emission once NUMA nodes carry memdev=
     self
 }
 ```
@@ -480,12 +480,16 @@ in the `arm-smmuv3` device args when `vCMDQ` is enabled.
 `Platform::to_qemu_args` dispatches by machine type because Q35 and virt require
 different argument ordering.
 
-**virt / Grace (aarch64)** — backends must precede the machine line because virt
-carries `memory-backend=<id>` on the machine flag itself:
+**virt / Grace (aarch64)**: backends precede the machine line because a GPU-less
+virt machine references `memory-backend=<id>` on the machine flag itself.  As soon
+as any NUMA node carries `memdev=` (every GPU topology binds `m0` to node 0 that
+way), the machine line drops `memory-backend=`: QEMU rejects the pair with
+"'-machine memory-backend' and '-numa memdev' properties are mutually exclusive"
+(`hw/core/numa.c`, `numa_complete_configuration`) and exits at startup.
 
 1. `-object iommufd,id=iommufd0`
 2. `Objects::memory_backends` (all `-object` lines)
-3. `-machine virt,...,memory-backend=m0`
+3. `-machine virt,...` (`memory-backend=m0` only when no NUMA node has `memdev=`)
 4. **CpuMem** `-numa node` entries: one per socket, `cpus=` + `memdev=`
 5. **GPU initiator** `-numa node` entries: 8 per GPU, no `cpus`/`memdev`
 6. **EGM / memory-only** `-numa node` entries
@@ -596,7 +600,7 @@ All Grace configurations share these constants:
 ```text
 -object iommufd,id=iommufd0
 -object memory-backend-ram,size=16G,id=m0
--machine virt,accel=kvm,gic-version=3,ras=on,highmem-mmio-size=4T,memory-backend=m0
+-machine virt,accel=kvm,gic-version=3,ras=on,highmem-mmio-size=4T
 -numa node,memdev=m0,cpus=0-3,nodeid=0
 -numa node,nodeid=1
 ...
@@ -620,7 +624,7 @@ root port).  Repeat the pxb-pcie/`smmuv3`/root-port/vfio block 4 times:
 ```text
 -object iommufd,id=iommufd0
 -object memory-backend-ram,size=16G,id=m0
--machine virt,...,highmem-mmio-size=4T,memory-backend=m0
+-machine virt,...,highmem-mmio-size=4T
 -numa node,memdev=m0,cpus=0-3,nodeid=0
 -numa node,nodeid=1 ... -numa node,nodeid=32   # 4×8 = 32 GPU initiator nodes
 
@@ -684,7 +688,8 @@ hardware for the queue base address), and `cmdqv=on` is added to `arm-smmuv3`:
 
 ```text
 -object memory-backend-file,id=m0,size=16G,mem-path=/dev/hugepages/,prealloc=on,share=on
--machine virt,...,memory-backend=m0
+-machine virt,...
+-numa node,memdev=m0,cpus=0-3,nodeid=0
 -device arm-smmuv3,...,cmdqv=on
 ```
 

@@ -58,6 +58,10 @@ pub(crate) struct BaseMachine {
     /// `None` for topologies that supply memory per NUMA node via `-numa node,memdev=`
     /// rather than a single machine-wide backend (e.g. multi-socket vEGM).
     /// Q35 never uses this field; virt uses it for the single-backend case.
+    ///
+    /// Emission drops it whenever any NUMA node carries `memdev=`: QEMU treats
+    /// `-machine memory-backend=` and `-numa node,memdev=` as mutually exclusive
+    /// (hw/core/numa.c, numa_complete_configuration) and exits at startup.
     pub memory_backend: Option<String>,
     pub cpu: CpuConfig,
 }
@@ -639,8 +643,8 @@ impl Platform {
     /// Emit the complete QEMU command-line argument list.
     ///
     /// Dispatch by machine type: Q35 and virt/Grace have different emission
-    /// ordering because virt requires `memory-backend=` on the machine line
-    /// (backends must precede machine), whereas Q35 does not.
+    /// ordering because virt may reference `memory-backend=` on the machine
+    /// line (backends must precede machine), whereas Q35 does not.
     pub(crate) fn to_qemu_args(&self) -> Result<Vec<String>> {
         match &self.machine {
             Machine::Q35(_) => self.emit_q35_args(),
@@ -648,6 +652,10 @@ impl Platform {
             Machine::Pseries(_) => todo!("pSeries args"),
             Machine::S390xCcwVirtio(_) => todo!("s390x args"),
         }
+    }
+
+    fn numa_has_memdev(&self) -> bool {
+        self.objects.numa_nodes.iter().any(|n| n.memdev.is_some())
     }
 
     /// Q35 emission order:
@@ -666,7 +674,7 @@ impl Platform {
         }
 
         args.push("-machine".to_owned());
-        args.push(emit_machine(&self.machine));
+        args.push(emit_machine(&self.machine, self.numa_has_memdev()));
 
         for (backend, node) in self
             .objects
@@ -721,7 +729,8 @@ impl Platform {
     /// virt / Grace emission order (unchanged from Phase 2):
     ///   1. iommufd object
     ///   2. memory backends
-    ///   3. -machine (references memory-backend=)
+    ///   3. -machine (references memory-backend= only when no NUMA node
+    ///      carries memdev=; the two are mutually exclusive in QEMU)
     ///   4. NUMA nodes
     ///   5. pxb-pcie + arm-smmuv3 + root ports + vfio
     ///   6. acpi_links (GenericInitiators then EgmMemory)
@@ -749,7 +758,7 @@ impl Platform {
         }
 
         args.push("-machine".to_owned());
-        args.push(emit_machine(&self.machine));
+        args.push(emit_machine(&self.machine, self.numa_has_memdev()));
 
         for node in &self.objects.numa_nodes {
             args.push("-numa".to_owned());
@@ -920,7 +929,7 @@ fn emit_protection(prot: &ProtectionDevice) -> String {
     }
 }
 
-fn emit_machine(machine: &Machine) -> String {
+fn emit_machine(machine: &Machine, numa_has_memdev: bool) -> String {
     match machine {
         Machine::Q35(q) => {
             let mut s = format!("q35,accel={}", q.base.accel);
@@ -941,8 +950,10 @@ fn emit_machine(machine: &Machine) -> String {
             if let Some(sz) = v.highmem_mmio_size {
                 s.push_str(&format!(",highmem-mmio-size={}", format_memory(sz)));
             }
-            if let Some(mb) = &v.base.memory_backend {
-                s.push_str(&format!(",memory-backend={mb}"));
+            if !numa_has_memdev {
+                if let Some(mb) = &v.base.memory_backend {
+                    s.push_str(&format!(",memory-backend={mb}"));
+                }
             }
             s
         }

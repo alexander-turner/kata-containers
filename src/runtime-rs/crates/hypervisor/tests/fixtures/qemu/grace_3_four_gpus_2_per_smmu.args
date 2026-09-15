@@ -9,7 +9,7 @@ iommufd,id=iommufd0
 -object
 memory-backend-ram,id=m0,size=16G
 -machine
-virt,accel=kvm,gic-version=3,ras=on,highmem-mmio-size=4T,memory-backend=m0
+virt,accel=kvm,gic-version=3,ras=on,highmem-mmio-size=4T
 -numa
 node,memdev=m0,cpus=0-3,nodeid=0
 -numa
