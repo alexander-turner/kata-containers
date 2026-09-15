@@ -365,10 +365,8 @@ impl Platform {
         let mut gpu_idx = 0usize;
 
         for (group_idx, group) in topo.gpu_smmu_groups.iter().enumerate() {
-            // 32-bus spacing between pxb complexes: each pxb may have up to 31
-            // subordinate buses (one per root port + potential downstream buses).
             // Production captures show bus_nr=32 for pxb-numa0, 64 for pxb-numa1.
-            let bus_nr = 32u8 + (group_idx as u8) * 32;
+            let bus_nr = pxb_bus_nr(group_idx);
 
             let cpu_mem_node = socket_numa_node(&topo.sockets, group.socket);
             let pxb_id = format!("pxb-numa{group_idx}");
@@ -473,12 +471,9 @@ impl Platform {
 
         let mut gpu_idx = 0usize;
         let mut port_idx = 1usize;
-        let mut bus_nr_running: u8 = 0;
 
         for (group_idx, group) in topo.gpu_smmu_groups.iter().enumerate() {
-            let n_ports = group.pci_bus_addrs.len();
-            let bus_nr = 1u8 + bus_nr_running;
-            bus_nr_running += if n_ports <= 1 { 1 } else { n_ports as u8 * 4 };
+            let bus_nr = pxb_bus_nr(group_idx);
 
             let cpu_mem_node = socket_numa_node(&topo.sockets, group.socket);
             let group_has_egm = topo.egm_sockets.iter().any(|e| e.socket == group.socket);
@@ -550,12 +545,10 @@ impl Platform {
         let gpu_group_count = topo.gpu_smmu_groups.len();
         let mut nic_dev_idx = gpu_idx;
         for (nic_group_idx, group) in topo.nic_smmu_groups.iter().enumerate() {
-            let n_ports = group.pci_bus_addrs.len();
-            let bus_nr = 1u8 + bus_nr_running;
-            bus_nr_running += if n_ports <= 1 { 1 } else { n_ports as u8 * 4 };
+            let global_group_idx = gpu_group_count + nic_group_idx;
+            let bus_nr = pxb_bus_nr(global_group_idx);
 
             let cpu_mem_node = socket_numa_node(&topo.sockets, group.socket);
-            let global_group_idx = gpu_group_count + nic_group_idx;
             let pxb_id = format!("pcie.{}", global_group_idx + 1);
 
             let mut root_ports = Vec::new();
@@ -1094,6 +1087,19 @@ fn emit_vfio_grace(vfio: &VfioDevice, port_id: &str, iommufd: Option<&IommufdBac
         s.push_str(&format!(",iommufd={}", ifd.id));
     }
     s
+}
+
+/// Guest bus number of the `complex_idx`-th `pxb-pcie` (0-based), 0x20 apart.
+///
+/// Shared by Q35 and virt.  Two constraints pin the scheme: the firmware
+/// numbers the secondary buses of everything on `pcie.0` (hot-plug root ports,
+/// `pcie_root_port = N`) upwards from 1, so expander buses must sit above that
+/// range; and the kata-agent recognises a guest PCI path as pxb-rooted only
+/// when its first segment is >= 0x20 (`PXB_PCIE_ROOT_BUS_MIN`).  Each complex
+/// then owns 31 secondary bus numbers for its root ports, and at most seven
+/// complexes fit below 0x100.
+fn pxb_bus_nr(complex_idx: usize) -> u8 {
+    0x20u8 * (complex_idx as u8 + 1)
 }
 
 fn socket_numa_node(sockets: &[SocketInfo], socket_id: u32) -> u32 {

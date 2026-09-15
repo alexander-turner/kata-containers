@@ -550,7 +550,10 @@ of entries in `gpu_smmu_groups` and `pci_bus_addrs`.  The model scales linearly:
 each GPU gets exactly one `pcie-root-port` on a `pxb-pcie`; GPUs on the same NUMA
 socket share a pxb complex.  `apply_q35_defaults` assigns:
 
-- `bus_nr = 32 + group_idx × 32` per pxb (32-bus spacing matches production captures)
+- `bus_nr = 0x20 × (complex_idx + 1)` per pxb (`pxb_bus_nr`, shared with virt since
+  Phase 7): expander buses sit above the secondary-bus range the firmware hands to
+  `pcie.0` root ports, and the kata-agent only treats a guest PCI path as pxb-rooted
+  when its first segment is >= 0x20
 - `chassis = 10 + group_idx` per pxb (unique chassis per complex, e.g. 10, 11)
 - `slot = port_index_within_pxb` (0-based, unique per pxb)
 - `id = rp-numa{group}-{port}` (port-relative, not global GPU index)
@@ -605,7 +608,7 @@ All Grace configurations share these constants:
 -numa node,nodeid=1
 ...
 -numa node,nodeid=8
--device pxb-pcie,id=pcie.1,bus_nr=1,bus=pcie.0,numa_node=0
+-device pxb-pcie,id=pcie.1,bus_nr=32,bus=pcie.0,numa_node=0
 -device arm-smmuv3,primary-bus=pcie.1,id=smmuv3.1,accel=on,ats=on,ril=off,pasid=on,oas=48
 -device pcie-root-port,id=pcie.port1,bus=pcie.1,chassis=1,io-reserve=0
 -device vfio-pci-nohotplug,host=0008:06:00.0,bus=pcie.port1,rombar=0,id=dev0,iommufd=iommufd0
@@ -629,7 +632,7 @@ root port).  Repeat the pxb-pcie/`smmuv3`/root-port/vfio block 4 times:
 -numa node,nodeid=1 ... -numa node,nodeid=32   # 4×8 = 32 GPU initiator nodes
 
 # Per GPU (N = 1..4):
--device pxb-pcie,id=pcie.N,bus_nr=N,bus=pcie.0,numa_node=0
+-device pxb-pcie,id=pcie.N,bus_nr=<32*N>,bus=pcie.0,numa_node=0
 -device arm-smmuv3,primary-bus=pcie.N,id=smmuv3.N,accel=on,ats=on,ril=off,pasid=on,oas=48
 -device pcie-root-port,id=pcie.portN,bus=pcie.N,chassis=N,io-reserve=0
 -device vfio-pci-nohotplug,host=<addr>,bus=pcie.portN,rombar=0,id=dev<N-1>,iommufd=iommufd0
@@ -645,14 +648,14 @@ GPUs sharing a physical `SMMU` share one `PciRootComplex` with **2 root ports**.
 2 complexes × 2 GPUs each:
 
 ```text
--device pxb-pcie,id=pcie.1,bus_nr=1,bus=pcie.0,numa_node=0
+-device pxb-pcie,id=pcie.1,bus_nr=32,bus=pcie.0,numa_node=0
 -device arm-smmuv3,primary-bus=pcie.1,id=smmuv3.1,accel=on,ats=on,ril=off,pasid=on,oas=48
 -device pcie-root-port,id=pcie.port1,bus=pcie.1,chassis=1,io-reserve=0
 -device vfio-pci-nohotplug,host=0008:06:00.0,bus=pcie.port1,rombar=0,id=dev0,iommufd=iommufd0
 -device pcie-root-port,id=pcie.port2,bus=pcie.1,chassis=2,io-reserve=0
 -device vfio-pci-nohotplug,host=0009:06:00.0,bus=pcie.port2,rombar=0,id=dev1,iommufd=iommufd0
 
--device pxb-pcie,id=pcie.2,bus_nr=9,bus=pcie.0,numa_node=0
+-device pxb-pcie,id=pcie.2,bus_nr=64,bus=pcie.0,numa_node=0
 -device arm-smmuv3,primary-bus=pcie.2,id=smmuv3.2,accel=on,ats=on,ril=off,pasid=on,oas=48
 -device pcie-root-port,id=pcie.port3,bus=pcie.2,chassis=3,io-reserve=0
 -device vfio-pci-nohotplug,host=0010:06:00.0,bus=pcie.port3,rombar=0,id=dev2,iommufd=iommufd0
@@ -989,7 +992,8 @@ Key observations from the SEV-SNP + GPU invocation:
   used on Grace; one `iommufd` object per GPU
 - `x-pci-vendor-id=0x10de,x-pci-device-id=0x2321` overrides required so the guest
   sees the correct device IDs for measured boot / attestation
-- `pxb-pcie bus_nr=32` (not the Grace 1-indexed cumulative formula)
+- `pxb-pcie bus_nr=32` (0x20 spacing; Grace used a 1-indexed cumulative formula
+  until Phase 7 aligned both machine types on `pxb_bus_nr`)
 - BIOS: `AMDSEV.fd` (AMD-specific OVMF build, not generic `OVMF.fd`)
 - Binary: `qemu-system-x86_64-snp-experimental` (patched QEMU for SNP support)
 
