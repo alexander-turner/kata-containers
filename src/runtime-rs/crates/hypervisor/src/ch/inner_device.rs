@@ -10,6 +10,7 @@ use crate::device::pci_path::PciPath;
 use crate::device::DeviceType;
 use crate::utils::create_dir_all_with_inherit_owner;
 use crate::utils::open_named_tuntap;
+use crate::HostDevice;
 use crate::HybridVsockDevice;
 use crate::NetworkConfig;
 use crate::NetworkDevice;
@@ -47,6 +48,32 @@ use tokio::sync::Mutex;
 use virtio_bindings::bindings::virtio_blk::VIRTIO_BLK_ID_BYTES;
 
 const VIRTIO_FS: &str = "virtio-fs";
+
+const PCI_VENDOR_ID_NVIDIA: u32 = 0x10de;
+const PCI_BASE_CLASS_DISPLAY: u32 = 0x03;
+
+// Parse a PCI ID or class code as read from sysfs, e.g. "0x10de".
+fn parse_pci_hex(value: &str) -> Option<u32> {
+    u32::from_str_radix(value.trim().trim_start_matches("0x"), 16).ok()
+}
+
+// Cloud Hypervisor writes the GPUDirect clique capability at a config space
+// offset that only NVIDIA GPUs leave free, so, as QEMU does, only set the
+// clique for those.
+fn is_nvidia_gpu(vendor_id: Option<&str>, class_code: Option<u32>) -> bool {
+    vendor_id.and_then(parse_pci_hex) == Some(PCI_VENDOR_ID_NVIDIA)
+        && class_code.map(|class_code| class_code >> 16) == Some(PCI_BASE_CLASS_DISPLAY)
+}
+
+fn is_nvidia_gpu_host_device(device: &HostDevice) -> bool {
+    device
+        .device_vendor_class
+        .as_ref()
+        .and_then(|vendor_class| vendor_class.get_vendor_class_id().ok())
+        .is_some_and(|(vendor_id, class_code)| {
+            is_nvidia_gpu(Some(vendor_id), parse_pci_hex(class_code))
+        })
+}
 
 impl CloudHypervisorInner {
     pub(crate) async fn add_device(&mut self, device: DeviceType) -> Result<DeviceType> {
@@ -190,11 +217,11 @@ impl CloudHypervisorInner {
 
         let sysfsdev = primary_device.sysfs_path.clone();
 
-        let device_config = DeviceConfig {
-            path: PathBuf::from(sysfsdev),
-            iommu: false,
-            ..Default::default()
-        };
+        let device_config = self.vfio_device_config(
+            PathBuf::from(sysfsdev),
+            is_nvidia_gpu_host_device(&primary_device),
+            false,
+        );
 
         let response = cloud_hypervisor_vm_device_add(&self.api_socket, device_config).await?;
 
@@ -215,6 +242,41 @@ impl CloudHypervisorInner {
         }
 
         Ok(DeviceType::Vfio(vfio_device))
+    }
+
+    /// Build the Cloud Hypervisor configuration of a VFIO device.
+    ///
+    /// Cloud Hypervisor creates its virtio-iommu at boot if a device asks for
+    /// it. It only hot plugs a device behind it on a PCI segment listed in
+    /// platform.iommu_segments, where every device must be behind it. All
+    /// devices share segment 0 without the vIOMMU here, so only cold-plugged
+    /// VFIO devices follow enable_iommu.
+    ///
+    /// Cloud Hypervisor does not map the BARs of a device behind the vIOMMU
+    /// in the host IOMMU, so PCIe peer-to-peer DMA to it, which the GPUDirect
+    /// clique advertises, needs the guest to map them through the
+    /// virtio-iommu. NVLink is unaffected.
+    fn vfio_device_config(
+        &self,
+        sysfs_path: PathBuf,
+        is_nvidia_gpu: bool,
+        cold_plug: bool,
+    ) -> DeviceConfig {
+        let device_info = &self.config.device_info;
+
+        if device_info.enable_iommu && !cold_plug {
+            warn!(
+                sl!(),
+                "hot-plugging VFIO device {:?} without the vIOMMU", sysfs_path
+            );
+        }
+
+        DeviceConfig {
+            path: sysfs_path,
+            iommu: device_info.enable_iommu && cold_plug,
+            x_nv_gpudirect_clique: device_info.gpudirect_clique.filter(|_| is_nvidia_gpu),
+            ..Default::default()
+        }
     }
 
     async fn inner_remove_device(&mut self, device_id: &str) -> Result<()> {
@@ -475,11 +537,11 @@ impl CloudHypervisorInner {
 
                     let primary_device = primary_device.clone();
                     let sysfsdev = primary_device.sysfs_path.clone();
-                    let device_config = DeviceConfig {
-                        path: PathBuf::from(sysfsdev),
-                        iommu: false,
-                        ..Default::default()
-                    };
+                    let device_config = self.vfio_device_config(
+                        PathBuf::from(sysfsdev),
+                        is_nvidia_gpu_host_device(&primary_device),
+                        true,
+                    );
                     info!(
                         sl!(),
                         "get host_devices primary device {:?}", primary_device
@@ -680,6 +742,80 @@ mod tests {
             }
         }
         assert!(ch.pending_devices.is_empty());
+    }
+
+    #[test]
+    fn test_is_nvidia_gpu() {
+        // 3D and VGA controllers.
+        assert!(is_nvidia_gpu(Some("0x10de"), Some(0x030200)));
+        assert!(is_nvidia_gpu(Some("0x10de\n"), Some(0x030000)));
+        // NVSwitch (bridge class) and a NIC from another vendor.
+        assert!(!is_nvidia_gpu(Some("0x10de"), Some(0x068000)));
+        assert!(!is_nvidia_gpu(Some("0x15b3"), Some(0x020000)));
+        assert!(!is_nvidia_gpu(None, Some(0x030200)));
+        assert!(!is_nvidia_gpu(Some("0x10de"), None));
+    }
+
+    #[test]
+    fn test_vfio_device_config() {
+        let mut ch = CloudHypervisorInner::default();
+        let path = PathBuf::from("/sys/bus/pci/devices/0000:41:00.0");
+
+        // By default, VFIO devices are configured as they always were.
+        for (is_nvidia_gpu, cold_plug) in [(false, false), (true, true)] {
+            assert_eq!(
+                ch.vfio_device_config(path.clone(), is_nvidia_gpu, cold_plug),
+                DeviceConfig {
+                    path: path.clone(),
+                    ..Default::default()
+                }
+            );
+        }
+
+        ch.config.device_info.enable_iommu = true;
+        ch.config.device_info.gpudirect_clique = Some(3);
+
+        let cold_plugged_gpu = ch.vfio_device_config(path.clone(), true, true);
+        assert!(cold_plugged_gpu.iommu);
+        assert_eq!(cold_plugged_gpu.x_nv_gpudirect_clique, Some(3));
+
+        // Cloud Hypervisor refuses to hot plug a device behind the vIOMMU
+        // outside of platform.iommu_segments.
+        let hot_plugged_gpu = ch.vfio_device_config(path.clone(), true, false);
+        assert!(!hot_plugged_gpu.iommu);
+        assert_eq!(hot_plugged_gpu.x_nv_gpudirect_clique, Some(3));
+
+        let cold_plugged_nic = ch.vfio_device_config(path, false, true);
+        assert!(cold_plugged_nic.iommu);
+        assert_eq!(cold_plugged_nic.x_nv_gpudirect_clique, None);
+    }
+
+    #[actix_rt::test]
+    async fn test_cold_plug_vfio_device_iommu() {
+        for enable_iommu in [false, true] {
+            let mut ch = CloudHypervisorInner::default();
+            ch.config.device_info.enable_iommu = enable_iommu;
+
+            let device = VfioDevice {
+                device_id: "vfio0".into(),
+                devices: vec![HostDevice {
+                    sysfs_path: "/sys/bus/pci/devices/0000:41:00.0".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            ch.add_device(DeviceType::Vfio(device)).await.unwrap();
+
+            let (_, _, host_devices, _, _) = ch.get_shared_devices().await.unwrap();
+            assert_eq!(
+                host_devices.unwrap(),
+                vec![DeviceConfig {
+                    path: "/sys/bus/pci/devices/0000:41:00.0".into(),
+                    iommu: enable_iommu,
+                    ..Default::default()
+                }]
+            );
+        }
     }
 
     #[rstest]

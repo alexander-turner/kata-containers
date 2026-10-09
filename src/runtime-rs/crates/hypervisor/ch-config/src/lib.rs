@@ -108,6 +108,8 @@ pub struct DeviceConfig {
     pub id: Option<String>,
     #[serde(default)]
     pub pci_segment: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub x_nv_gpudirect_clique: Option<u8>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -573,6 +575,31 @@ pub enum State {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_device_config_serialization() {
+        let mut device = DeviceConfig {
+            path: PathBuf::from("/sys/bus/pci/devices/0000:41:00.0"),
+            ..Default::default()
+        };
+
+        // The GPUDirect clique is left out unless it is set.
+        assert_eq!(
+            serde_json::to_value(&device).unwrap(),
+            serde_json::json!({
+                "path": "/sys/bus/pci/devices/0000:41:00.0",
+                "iommu": false,
+                "id": null,
+                "pci_segment": 0,
+            })
+        );
+
+        device.x_nv_gpudirect_clique = Some(3);
+        assert_eq!(
+            serde_json::to_value(&device).unwrap()["x_nv_gpudirect_clique"],
+            3
+        );
+    }
 
     #[test]
     fn test_vm_resize_serialization_preserves_256_vcpus() {

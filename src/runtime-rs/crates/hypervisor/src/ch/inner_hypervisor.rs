@@ -142,6 +142,13 @@ impl CloudHypervisorInner {
         let mut extra_params = KernelParams::from_string(&extra_options.join(" "));
         params.append(&mut extra_params);
 
+        // VFIO devices are attached to the virtio-iommu when the vIOMMU is
+        // enabled. Keep their DMA untranslated by default, as the Go
+        // runtime does.
+        if cfg.device_info.enable_iommu {
+            params.append(&mut KernelParams::from_string("iommu=pt"));
+        }
+
         // Emit an activation parameter even for extensions without dm-verity.
         // An empty value renders as a bare key, as it does for QEMU.
         for extra in &cfg.guest_extension_images {
@@ -1172,6 +1179,18 @@ mod tests {
         ch.config.guest_extension_images.clear();
         let params = ch.get_kernel_params().await.unwrap();
         assert!(!params.contains("kata.extension."));
+    }
+
+    #[actix_rt::test]
+    async fn test_iommu_kernel_params() {
+        let mut ch = CloudHypervisorInner::default();
+
+        let params = ch.get_kernel_params().await.unwrap();
+        assert!(!params.split_whitespace().any(|param| param == "iommu=pt"));
+
+        ch.config.device_info.enable_iommu = true;
+        let params = ch.get_kernel_params().await.unwrap();
+        assert!(params.split_whitespace().any(|param| param == "iommu=pt"));
     }
 
     #[actix_rt::test]
