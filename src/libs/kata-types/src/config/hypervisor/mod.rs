@@ -806,6 +806,10 @@ pub struct DeviceInfo {
     /// Accepted values: `"no-port"` (default, disabled), `"root-port"`.
     /// In confidential compute environments hot-plugging can compromise
     /// security, so devices are cold-plugged instead.
+    ///
+    /// Hypervisors that place VFIO devices themselves ignore the port type.
+    /// For instance, Cloud Hypervisor has no PCIe root ports and puts the
+    /// devices on its root bus.
     #[serde(default)]
     pub cold_plug_vfio: String,
 

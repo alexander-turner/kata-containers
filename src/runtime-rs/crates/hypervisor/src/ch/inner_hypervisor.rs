@@ -238,6 +238,10 @@ impl CloudHypervisorInner {
             debug!(sl!(), "vm start response: {:?}", detail);
         }
 
+        self.resolve_cold_plugged_vfio_devices()
+            .await
+            .context("resolve cold-plugged VFIO devices")?;
+
         Ok(())
     }
 

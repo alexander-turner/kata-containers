@@ -5,6 +5,7 @@
 
 use super::HypervisorState;
 use crate::device::DeviceType;
+use crate::VfioDeviceModern;
 use crate::VmmState;
 use anyhow::Result;
 use async_trait::async_trait;
@@ -14,7 +15,9 @@ use kata_types::config::hypervisor::Hypervisor as HypervisorConfig;
 use kata_types::config::hypervisor::HYPERVISOR_NAME_CH;
 use persist::sandbox_persist::Persist;
 use std::collections::HashMap;
+use std::sync::Arc;
 use tokio::sync::watch::{channel, Receiver, Sender};
+use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tokio::{process::Child, sync::mpsc};
 
@@ -46,6 +49,10 @@ pub struct CloudHypervisorInner {
 
     /// List of devices that will be added to the VM once it boots
     pub(crate) pending_devices: Vec<DeviceType>,
+
+    /// VFIO devices added to the VM at boot, whose guest PCI paths are only
+    /// known once it has booted.
+    pub(crate) cold_plugged_vfio_devices: Vec<Arc<Mutex<VfioDeviceModern>>>,
 
     pub(crate) _capabilities: Capabilities,
 
@@ -97,6 +104,7 @@ impl CloudHypervisorInner {
             run_dir: String::default(),
             netns: None,
             pending_devices: vec![],
+            cold_plugged_vfio_devices: vec![],
             device_ids: HashMap::<String, String>::new(),
             _capabilities: capabilities,
             shutdown_tx: Some(tx),

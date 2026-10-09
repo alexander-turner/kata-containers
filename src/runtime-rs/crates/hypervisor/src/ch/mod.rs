@@ -121,6 +121,12 @@ impl Hypervisor for CloudHypervisor {
         inner.update_device(device).await
     }
 
+    // Cloud Hypervisor has no PCIe root ports: it puts VFIO devices on the
+    // root bus and picks their slots itself.
+    fn requires_generic_vfio_topology(&self) -> bool {
+        false
+    }
+
     async fn set_rootless_user(&self, user: RootlessUser) -> Result<()> {
         let mut inner = self.inner.write().await;
         let mut config = inner.hypervisor_config();
@@ -244,5 +250,33 @@ impl Persist for CloudHypervisor {
             inner: Arc::new(RwLock::new(inner)),
             exit_waiter: Mutex::new((exit_waiter, 0)),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::device::Device;
+    use crate::VfioDeviceModernHandle;
+
+    #[actix_rt::test]
+    async fn test_vfio_device_attach_without_topology() {
+        let ch = CloudHypervisor::new();
+        assert!(!ch.requires_generic_vfio_topology());
+
+        // VFIO devices reach Cloud Hypervisor without being placed in the
+        // shared PCIe topology, which it has no use for.
+        let mut handle = VfioDeviceModernHandle {
+            inner: Default::default(),
+        };
+        handle.attach(&mut None, &ch).await.unwrap();
+
+        assert_eq!(handle.attach_count().await, 1);
+        assert!(!handle.with(|device| device.is_allocated).await);
+        let inner = ch.inner.read().await;
+        assert!(matches!(
+            inner.pending_devices.as_slice(),
+            [DeviceType::VfioModern(_)]
+        ));
     }
 }

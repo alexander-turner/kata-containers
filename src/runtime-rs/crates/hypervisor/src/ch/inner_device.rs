@@ -10,6 +10,7 @@ use crate::device::pci_path::PciPath;
 use crate::device::DeviceType;
 use crate::utils::create_dir_all_with_inherit_owner;
 use crate::utils::open_named_tuntap;
+use crate::vfio_device::VfioDeviceType;
 use crate::HostDevice;
 use crate::HybridVsockDevice;
 use crate::NetworkConfig;
@@ -18,26 +19,29 @@ use crate::ProtectionDeviceConfig;
 use crate::ShareFsConfig;
 use crate::ShareFsDevice;
 use crate::VfioDevice;
+use crate::VfioDeviceModern;
 use crate::VmmState;
 use crate::{BlockConfigModern, BlockDeviceModern};
 use anyhow::{anyhow, Context, Result};
 use ch_config::ch_api::cloud_hypervisor_vm_device_add;
 use ch_config::ch_api::{
     cloud_hypervisor_vm_blockdev_add, cloud_hypervisor_vm_device_remove,
-    cloud_hypervisor_vm_fs_add, cloud_hypervisor_vm_netdev_add_with_fds,
+    cloud_hypervisor_vm_fs_add, cloud_hypervisor_vm_info, cloud_hypervisor_vm_netdev_add_with_fds,
     cloud_hypervisor_vm_vsock_add, PciDeviceInfo, VmRemoveDeviceData,
 };
 use ch_config::convert::{DEFAULT_DISK_QUEUES, DEFAULT_DISK_QUEUE_SIZE, DEFAULT_NUM_PCI_SEGMENTS};
 use ch_config::DiskConfig;
 use ch_config::ImageType;
 use ch_config::{
-    net_util::MacAddr, DeviceConfig, FsConfig, NetConfig, ProtectionDevConfig, VsockConfig,
+    net_util::MacAddr, DeviceConfig, DeviceNode, FsConfig, NetConfig, ProtectionDevConfig,
+    VsockConfig,
 };
 use kata_sys_util::netns::NetnsGuard;
 use kata_types::config::hypervisor::RateLimiterConfig;
 use kata_types::rootless::is_rootless;
 
 use safe_path::scoped_join;
+use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::os::fd::AsRawFd;
 use std::os::fd::IntoRawFd;
@@ -100,10 +104,14 @@ impl CloudHypervisorInner {
             //
             // - Network details need to be saved for later application.
             //
+            // - VFIO devices requested before the VM is running are
+            //   cold-plugged as entries of VmConfig.devices.
+            //
             match device {
                 DeviceType::ShareFs(_) => self.pending_devices.insert(0, device.clone()),
                 DeviceType::Network(_) => self.pending_devices.insert(0, device.clone()),
                 DeviceType::Vfio(_) => self.pending_devices.insert(0, device.clone()),
+                DeviceType::VfioModern(_) => self.pending_devices.insert(0, device.clone()),
                 DeviceType::Protection(_) => self.pending_devices.insert(0, device.clone()),
                 DeviceType::BlockModern(_) => self.pending_devices.insert(0, device.clone()),
                 _ => {
@@ -126,6 +134,7 @@ impl CloudHypervisorInner {
             DeviceType::HybridVsock(hvsock) => self.handle_hvsock_device(hvsock).await,
             DeviceType::BlockModern(block) => self.handle_block_device(block).await,
             DeviceType::Vfio(vfiodev) => self.handle_vfio_device(vfiodev).await,
+            DeviceType::VfioModern(vfiodev) => self.handle_vfio_modern_device(vfiodev).await,
             DeviceType::Network(netdev) => self.handle_network_device(netdev).await,
             _ => Err(anyhow!("unhandled device: {:?}", device)),
         }
@@ -152,6 +161,10 @@ impl CloudHypervisorInner {
     pub(crate) async fn remove_device(&mut self, device: DeviceType) -> Result<()> {
         match device {
             DeviceType::Vfio(vfiodev) => self.inner_remove_device(vfiodev.device_id.as_str()).await,
+            DeviceType::VfioModern(vfiodev) => {
+                let device_id = vfiodev.lock().await.device_id.clone();
+                self.inner_remove_device(device_id.as_str()).await
+            }
             DeviceType::BlockModern(blockdev) => {
                 let device_id = blockdev.lock().await.device_id.clone();
                 self.inner_remove_device(device_id.as_str()).await
@@ -277,6 +290,116 @@ impl CloudHypervisorInner {
             x_nv_gpudirect_clique: device_info.gpudirect_clique.filter(|_| is_nvidia_gpu),
             ..Default::default()
         }
+    }
+
+    /// Build the Cloud Hypervisor configuration of a modern VFIO device.
+    fn vfio_modern_device_config(
+        &self,
+        device: &VfioDeviceModern,
+        cold_plug: bool,
+    ) -> Result<DeviceConfig> {
+        if device.device.device_type == VfioDeviceType::MediatedAp {
+            return Err(anyhow!(
+                "VFIO-AP device {} is not supported by Cloud Hypervisor",
+                device.device_id
+            ));
+        }
+
+        // As with legacy VFIO devices, only the primary function of a
+        // multi-function device or IOMMU group is passed to the VM. Cloud
+        // Hypervisor has no multi-function slots, and gives each device
+        // behind the vIOMMU its own VFIO container, which another device of
+        // the same IOMMU group cannot join.
+        let primary = &device.device.primary;
+        if device.device.devices.len() > 1 {
+            warn!(
+                sl!(),
+                "only passing primary function {} of VFIO device {} to the VM",
+                primary.addr,
+                device.device_id
+            );
+        }
+
+        Ok(self.vfio_device_config(
+            primary.sysfs_path.clone(),
+            is_nvidia_gpu(primary.vendor_id.as_deref(), primary.class_code),
+            cold_plug,
+        ))
+    }
+
+    async fn handle_vfio_modern_device(
+        &mut self,
+        device: Arc<Mutex<VfioDeviceModern>>,
+    ) -> Result<DeviceType> {
+        let (device_id, device_config) = {
+            let vfio_device = device.lock().await;
+            (
+                vfio_device.device_id.clone(),
+                self.vfio_modern_device_config(&vfio_device, false)?,
+            )
+        };
+
+        let response = cloud_hypervisor_vm_device_add(&self.api_socket, device_config).await?;
+
+        if let Some(detail) = response {
+            debug!(sl!(), "VFIO add response: {:?}", detail);
+
+            // Store the cloud-hypervisor device id to be used later for removing the device
+            let dev_info: PciDeviceInfo =
+                serde_json::from_str(detail.as_str()).map_err(|e| anyhow!(e))?;
+            self.device_ids.insert(device_id, dev_info.id);
+
+            device.lock().await.config.guest_pci_path =
+                Some(Self::clh_pci_info_to_path(&dev_info.bdf)?);
+        }
+
+        Ok(DeviceType::VfioModern(device))
+    }
+
+    /// Cloud Hypervisor assigns the guest PCI addresses of cold-plugged
+    /// devices when the VM boots, so look them up in the VM device tree.
+    pub(crate) async fn resolve_cold_plugged_vfio_devices(&mut self) -> Result<()> {
+        if self.cold_plugged_vfio_devices.is_empty() {
+            return Ok(());
+        }
+
+        let vm_info = cloud_hypervisor_vm_info(&self.api_socket)
+            .await
+            .context("get VM info")?;
+
+        self.set_cold_plugged_vfio_paths(&vm_info.device_tree.unwrap_or_default())
+            .await
+    }
+
+    async fn set_cold_plugged_vfio_paths(
+        &mut self,
+        device_tree: &HashMap<String, DeviceNode>,
+    ) -> Result<()> {
+        for vfio_device in self.cold_plugged_vfio_devices.drain(..) {
+            let mut vfio_device = vfio_device.lock().await;
+
+            // Cold-plugged devices are named after their device id.
+            let bdf = device_tree
+                .get(&vfio_device.device_id)
+                .and_then(|node| node.pci_bdf.as_deref())
+                .ok_or_else(|| {
+                    anyhow!(
+                        "no guest PCI address for VFIO device {}",
+                        vfio_device.device_id
+                    )
+                })?;
+            let guest_pci_path = Self::clh_pci_info_to_path(bdf)?;
+
+            info!(
+                sl!(),
+                "cold-plugged VFIO device {} has guest PCI path {}",
+                vfio_device.device_id,
+                guest_pci_path
+            );
+            vfio_device.config.guest_pci_path = Some(guest_pci_path);
+        }
+
+        Ok(())
     }
 
     async fn inner_remove_device(&mut self, device_id: &str) -> Result<()> {
@@ -548,6 +671,23 @@ impl CloudHypervisorInner {
                     );
                     host_devices.push(device_config);
                 }
+                DeviceType::VfioModern(vfio_device) => {
+                    let (device_id, mut device_config) = {
+                        let device = vfio_device.lock().await;
+                        (
+                            device.device_id.clone(),
+                            self.vfio_modern_device_config(&device, true)?,
+                        )
+                    };
+                    // Name the device so that its guest PCI address can be
+                    // found in the device tree once the VM has booted.
+                    device_config.id = Some(device_id.clone());
+                    info!(sl!(), "cold-plugging VFIO device {:?}", &device_config);
+
+                    self.device_ids.insert(device_id.clone(), device_id);
+                    self.cold_plugged_vfio_devices.push(vfio_device);
+                    host_devices.push(device_config);
+                }
                 DeviceType::Protection(pdev) => {
                     let config = pdev.config;
                     match config {
@@ -816,6 +956,154 @@ mod tests {
                 }]
             );
         }
+    }
+
+    // Build a VFIO device out of (host BDF, vendor ID, class code) PCI
+    // functions, the first one being the primary function.
+    fn vfio_modern_device(
+        device_id: &str,
+        functions: &[(&str, &str, u32)],
+    ) -> Arc<Mutex<VfioDeviceModern>> {
+        let mut device = VfioDeviceModern {
+            device_id: device_id.to_string(),
+            ..Default::default()
+        };
+        for (bdf, vendor_id, class_code) in functions {
+            device.device.devices.push(Default::default());
+            let function = device.device.devices.last_mut().unwrap();
+            function.sysfs_path = PathBuf::from(format!("/sys/bus/pci/devices/{bdf}"));
+            function.vendor_id = Some(vendor_id.to_string());
+            function.class_code = Some(*class_code);
+        }
+        device.device.primary = device.device.devices[0].clone();
+
+        Arc::new(Mutex::new(device))
+    }
+
+    #[actix_rt::test]
+    async fn test_cold_plug_vfio_modern_device() {
+        let gpu = vfio_modern_device("gpu0", &[("0000:41:00.0", "0x10de", 0x030200)]);
+        let nic = vfio_modern_device("nic0", &[("0000:c1:00.0", "0x15b3", 0x020000)]);
+
+        // The device configuration only changes when the vIOMMU or the
+        // GPUDirect clique are configured.
+        for (enable_iommu, clique) in [(false, None), (true, Some(2))] {
+            let mut ch = CloudHypervisorInner::default();
+            ch.config.device_info.enable_iommu = enable_iommu;
+            ch.config.device_info.gpudirect_clique = clique;
+
+            for device in [&gpu, &nic] {
+                ch.add_device(DeviceType::VfioModern(device.clone()))
+                    .await
+                    .unwrap();
+            }
+
+            let (_, _, host_devices, _, _) = ch.get_shared_devices().await.unwrap();
+            assert_eq!(
+                host_devices.unwrap(),
+                vec![
+                    DeviceConfig {
+                        path: "/sys/bus/pci/devices/0000:41:00.0".into(),
+                        iommu: enable_iommu,
+                        id: Some("gpu0".to_string()),
+                        x_nv_gpudirect_clique: clique,
+                        ..Default::default()
+                    },
+                    DeviceConfig {
+                        path: "/sys/bus/pci/devices/0000:c1:00.0".into(),
+                        iommu: enable_iommu,
+                        id: Some("nic0".to_string()),
+                        ..Default::default()
+                    },
+                ]
+            );
+            assert!(ch.pending_devices.is_empty());
+            assert_eq!(ch.cold_plugged_vfio_devices.len(), 2);
+            assert_eq!(ch.device_ids["gpu0"], "gpu0");
+            assert_eq!(ch.device_ids["nic0"], "nic0");
+        }
+    }
+
+    #[actix_rt::test]
+    async fn test_cold_plug_vfio_modern_device_primary_function() {
+        let mut ch = CloudHypervisorInner::default();
+        let device = vfio_modern_device(
+            "nic0",
+            &[
+                ("0000:c1:00.0", "0x15b3", 0x020000),
+                ("0000:c1:00.1", "0x15b3", 0x020000),
+            ],
+        );
+
+        ch.add_device(DeviceType::VfioModern(device)).await.unwrap();
+
+        let (_, _, host_devices, _, _) = ch.get_shared_devices().await.unwrap();
+        let host_devices = host_devices.unwrap();
+        assert_eq!(host_devices.len(), 1);
+        assert_eq!(
+            host_devices[0].path,
+            PathBuf::from("/sys/bus/pci/devices/0000:c1:00.0")
+        );
+    }
+
+    #[actix_rt::test]
+    async fn test_cold_plug_vfio_modern_ap_device() {
+        let mut ch = CloudHypervisorInner::default();
+        let device = vfio_modern_device("ap0", &[("", "", 0)]);
+        device.lock().await.device.device_type = VfioDeviceType::MediatedAp;
+
+        ch.add_device(DeviceType::VfioModern(device)).await.unwrap();
+
+        assert!(ch.get_shared_devices().await.is_err());
+    }
+
+    #[actix_rt::test]
+    async fn test_cold_plugged_vfio_paths() {
+        let mut ch = CloudHypervisorInner::default();
+        let gpus = [
+            vfio_modern_device("gpu0", &[("0000:41:00.0", "0x10de", 0x030200)]),
+            vfio_modern_device("gpu1", &[("0000:c1:00.0", "0x10de", 0x030200)]),
+        ];
+        ch.cold_plugged_vfio_devices = gpus.to_vec();
+
+        let device_tree = HashMap::from([
+            (
+                "gpu0".to_string(),
+                DeviceNode {
+                    id: "gpu0".to_string(),
+                    pci_bdf: Some("0000:00:06.0".to_string()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "gpu1".to_string(),
+                DeviceNode {
+                    id: "gpu1".to_string(),
+                    pci_bdf: Some("0000:00:0a.0".to_string()),
+                    ..Default::default()
+                },
+            ),
+        ]);
+        ch.set_cold_plugged_vfio_paths(&device_tree).await.unwrap();
+
+        for (gpu, path) in gpus.iter().zip(["06", "0a"]) {
+            let gpu = gpu.lock().await;
+            assert_eq!(gpu.config.guest_pci_path, PciPath::try_from(path).ok());
+            // The resource manager reports the primary function's path.
+            assert!(gpu.device_options.is_empty());
+        }
+        assert!(ch.cold_plugged_vfio_devices.is_empty());
+
+        // A device missing from the device tree cannot be found by the agent.
+        ch.cold_plugged_vfio_devices = vec![vfio_modern_device(
+            "gpu2",
+            &[("0000:c2:00.0", "0x10de", 0x030200)],
+        )];
+        let err = ch
+            .set_cold_plugged_vfio_paths(&device_tree)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("gpu2"), "{:?}", err);
     }
 
     #[rstest]
