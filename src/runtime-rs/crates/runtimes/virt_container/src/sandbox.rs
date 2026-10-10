@@ -681,11 +681,14 @@ impl VirtSandbox {
             .context("failed to query Pod Resources CDI devices")?;
             info!(sl!(), "pod cdi devices: {:?}", cdi_devices);
 
+            // CDI specs also list the VFIO control node (and /dev/iommu for
+            // iommufd), which are not pass-through devices.
             let device_nodes = handle_cdi_devices(&cdi_devices).await?;
             paths.extend(
                 device_nodes
                     .iter()
-                    .filter_map(pod_resources_rs::device_node_host_path),
+                    .filter_map(pod_resources_rs::device_node_host_path)
+                    .filter(|path| is_vfio_passthrough_path(path)),
             );
         }
 
@@ -784,9 +787,7 @@ impl VirtSandbox {
                     continue;
                 }
             };
-            // Only process VFIO passthrough devices under /dev/vfio/*.
-            // Skip non-VFIO devices and the legacy VFIO control node (/dev/vfio/vfio).
-            if !host_path.starts_with("/dev/vfio/") || host_path == "/dev/vfio/vfio" {
+            if !is_vfio_passthrough_path(&host_path) {
                 continue;
             }
             let device_port = if is_vfio_ap_device(Path::new(&host_path)) {
@@ -1321,10 +1322,29 @@ impl VirtSandbox {
     }
 }
 
+/// Whether `path` is a VFIO device to pass through: an IOMMU group node
+/// (`/dev/vfio/<group>`) or an iommufd per-device cdev
+/// (`/dev/vfio/devices/vfioX`). The legacy `/dev/vfio/vfio` control node and
+/// nodes outside `/dev/vfio/` (e.g. `/dev/iommu`) are not, although CDI specs
+/// and device plugins list them next to the devices.
+fn is_vfio_passthrough_path(path: &str) -> bool {
+    let Some(rest) = path.strip_prefix("/dev/vfio/") else {
+        return false;
+    };
+    let mut components = rest.split('/');
+    match components.next() {
+        None | Some("") | Some("vfio") => false,
+        Some("devices") => match (components.next(), components.next()) {
+            (Some(name), None) => !name.is_empty(),
+            _ => false,
+        },
+        Some(_) => components.next().is_none(),
+    }
+}
+
 /// Collect VFIO character device nodes (e.g. /dev/vfio/devices/vfio0) that a CDI
 /// runtime injected directly into the OCI spec for the Docker/nerdctl/podman
-/// flow, where there is no kubelet PodResources API to query. The legacy
-/// `/dev/vfio/vfio` control node is skipped as it is not a pass-through device.
+/// flow, where there is no kubelet PodResources API to query.
 fn oci_spec_vfio_device_paths() -> Vec<String> {
     let Ok(spec) = load_oci_spec() else {
         return Vec::new();
@@ -1340,7 +1360,7 @@ fn oci_spec_vfio_device_paths() -> Vec<String> {
         .iter()
         .filter(|dev| dev.typ() == oci::LinuxDeviceType::C)
         .map(|dev| dev.path().display().to_string())
-        .filter(|path| path.starts_with("/dev/vfio") && path != "/dev/vfio/vfio")
+        .filter(|path| is_vfio_passthrough_path(path))
         .collect()
 }
 
@@ -2449,5 +2469,35 @@ mod stop_vm_tests {
         );
         assert!(confirmed.is_cancelled());
         child.wait().await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod vfio_path_tests {
+    use super::is_vfio_passthrough_path;
+
+    #[test]
+    fn only_vfio_passthrough_paths_are_cold_plugged() {
+        let cases = [
+            ("/dev/vfio/16", true),
+            ("/dev/vfio/1", true),
+            ("/dev/vfio/devices/vfio0", true),
+            ("/dev/vfio/devices/vfio12", true),
+            ("/dev/vfio/vfio", false),
+            ("/dev/vfio/vfio/12", false),
+            ("/dev/vfio/devices", false),
+            ("/dev/vfio/devices/", false),
+            ("/dev/vfio/devices/vfio0/x", false),
+            ("/dev/vfio/16/", false),
+            ("/dev/vfio/", false),
+            ("/dev/vfio", false),
+            ("/dev/vfio-test", false),
+            ("/dev/iommu", false),
+            ("/dev/nvidia0", false),
+            ("", false),
+        ];
+        for (path, expected) in cases {
+            assert_eq!(is_vfio_passthrough_path(path), expected, "{path}");
+        }
     }
 }
