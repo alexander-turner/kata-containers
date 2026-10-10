@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
 
@@ -108,6 +109,8 @@ pub struct DeviceConfig {
     pub id: Option<String>,
     #[serde(default)]
     pub pci_segment: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub x_nv_gpudirect_clique: Option<u8>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -558,6 +561,23 @@ pub struct VmInfo {
     pub state: State,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub memory_actual_size: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_tree: Option<HashMap<String, DeviceNode>>,
+}
+
+/// DeviceNode : Device of the VM device tree, which is keyed by device id.
+/// The device resources are left out.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceNode {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
+    #[serde(default)]
+    pub children: Vec<String>,
+    /// Guest PCI address of a PCI device, e.g. "0000:00:05.0".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pci_bdf: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
@@ -573,6 +593,81 @@ pub enum State {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_device_config_serialization() {
+        let mut device = DeviceConfig {
+            path: PathBuf::from("/sys/bus/pci/devices/0000:41:00.0"),
+            ..Default::default()
+        };
+
+        // The GPUDirect clique is left out unless it is set.
+        assert_eq!(
+            serde_json::to_value(&device).unwrap(),
+            serde_json::json!({
+                "path": "/sys/bus/pci/devices/0000:41:00.0",
+                "iommu": false,
+                "id": null,
+                "pci_segment": 0,
+            })
+        );
+
+        device.x_nv_gpudirect_clique = Some(3);
+        assert_eq!(
+            serde_json::to_value(&device).unwrap()["x_nv_gpudirect_clique"],
+            3
+        );
+    }
+
+    #[test]
+    fn test_vm_info_device_tree() {
+        let vm_info: VmInfo = serde_json::from_value(serde_json::json!({
+            "config": {
+                "serial": { "mode": "Off" },
+                "console": { "mode": "Off" },
+            },
+            "state": "Running",
+            "memory_actual_size": 2147483648u64,
+            "device_tree": {
+                "__pci_bus0": {
+                    "id": "__pci_bus0",
+                    "resources": [],
+                    "children": ["vfio0"],
+                },
+                "vfio0": {
+                    "id": "vfio0",
+                    "resources": [{ "LegacyIrq": 5 }],
+                    "parent": "__pci_bus0",
+                    "children": [],
+                    "pci_bdf": "0000:00:05.0",
+                },
+            },
+        }))
+        .unwrap();
+
+        let device_tree = vm_info.device_tree.unwrap();
+        assert_eq!(
+            device_tree["vfio0"],
+            DeviceNode {
+                id: "vfio0".to_string(),
+                parent: Some("__pci_bus0".to_string()),
+                children: vec![],
+                pci_bdf: Some("0000:00:05.0".to_string()),
+            }
+        );
+        assert_eq!(device_tree["__pci_bus0"].pci_bdf, None);
+
+        // The device tree is only reported once the VM is booted.
+        let vm_info: VmInfo = serde_json::from_value(serde_json::json!({
+            "config": {
+                "serial": { "mode": "Off" },
+                "console": { "mode": "Off" },
+            },
+            "state": "Running",
+        }))
+        .unwrap();
+        assert!(vm_info.device_tree.is_none());
+    }
 
     #[test]
     fn test_vm_resize_serialization_preserves_256_vcpus() {

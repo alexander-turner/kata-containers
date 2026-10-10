@@ -75,6 +75,7 @@ const VIRTIO_FS: &str = "virtio-fs";
 const VIRTIO_FS_INLINE: &str = "inline-virtio-fs";
 const VIRTIO_FS_NYDUS: &str = "virtio-fs-nydus";
 const MAX_BRIDGE_SIZE: u32 = 5;
+const MAX_GPUDIRECT_CLIQUE: u8 = 15;
 const MAX_NETWORK_QUEUES: u32 = 256;
 
 const KERNEL_PARAM_DELIMITER: &str = " ";
@@ -805,6 +806,10 @@ pub struct DeviceInfo {
     /// Accepted values: `"no-port"` (default, disabled), `"root-port"`.
     /// In confidential compute environments hot-plugging can compromise
     /// security, so devices are cold-plugged instead.
+    ///
+    /// Hypervisors that place VFIO devices themselves ignore the port type.
+    /// For instance, Cloud Hypervisor has no PCIe root ports and puts the
+    /// devices on its root bus.
     #[serde(default)]
     pub cold_plug_vfio: String,
 
@@ -829,6 +834,17 @@ pub struct DeviceInfo {
     /// Set `iommu_platform=on` for VM devices.
     #[serde(default)]
     pub enable_iommu_platform: bool,
+
+    /// NVIDIA GPUDirect P2P clique ID of the GPUs passed through to the VM.
+    ///
+    /// GPUs sharing a clique ID can use PCIe peer-to-peer DMA with each
+    /// other. The hypervisor advertises the ID to the guest driver with an
+    /// emulated PCI capability on each NVIDIA GPU.
+    ///
+    /// Accepted values: 0 to 15. Unset (default) adds no capability.
+    /// Only Cloud Hypervisor uses it.
+    #[serde(default)]
+    pub gpudirect_clique: Option<u8>,
 
     /// Enable balloon device reporting.
     #[serde(default)]
@@ -858,6 +874,15 @@ impl DeviceInfo {
             return Err(std::io::Error::other(
                 "Root Port and Switch Port set at the same time is forbidden.",
             ));
+        }
+        // The PCI capability only has four bits for the clique ID.
+        if let Some(clique) = self
+            .gpudirect_clique
+            .filter(|&clique| clique > MAX_GPUDIRECT_CLIQUE)
+        {
+            return Err(std::io::Error::other(format!(
+                "GPUDirect clique ID {clique} is out of range 0-{MAX_GPUDIRECT_CLIQUE}",
+            )));
         }
 
         Ok(())
@@ -2283,5 +2308,21 @@ mod tests {
             blockdev_info_with_sectors(65536, 512).validate().is_err(),
             "logical > physical should be rejected"
         );
+    }
+
+    #[test]
+    fn test_validate_gpudirect_clique() {
+        for (clique, is_valid) in [
+            (None, true),
+            (Some(0), true),
+            (Some(15), true),
+            (Some(16), false),
+        ] {
+            let device_info = DeviceInfo {
+                gpudirect_clique: clique,
+                ..Default::default()
+            };
+            assert_eq!(device_info.validate().is_ok(), is_valid, "{clique:?}");
+        }
     }
 }

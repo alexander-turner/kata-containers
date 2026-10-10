@@ -99,6 +99,7 @@ use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use tracing::instrument;
 
+use crate::vfio_grant::VfioGrants;
 use crate::vmm_process::VmmProcessIdentity;
 
 pub(crate) const VIRTCONTAINER: &str = "virt_container";
@@ -187,6 +188,7 @@ pub struct VirtSandbox {
 
 #[derive(Default)]
 struct CleanupSteps {
+    vfio_grants: bool,
     hypervisor: bool,
     resources: bool,
     netns: bool,
@@ -681,11 +683,14 @@ impl VirtSandbox {
             .context("failed to query Pod Resources CDI devices")?;
             info!(sl!(), "pod cdi devices: {:?}", cdi_devices);
 
+            // CDI specs also list the VFIO control node (and /dev/iommu for
+            // iommufd), which are not pass-through devices.
             let device_nodes = handle_cdi_devices(&cdi_devices).await?;
             paths.extend(
                 device_nodes
                     .iter()
-                    .filter_map(pod_resources_rs::device_node_host_path),
+                    .filter_map(pod_resources_rs::device_node_host_path)
+                    .filter(|path| is_vfio_passthrough_path(path)),
             );
         }
 
@@ -784,9 +789,7 @@ impl VirtSandbox {
                     continue;
                 }
             };
-            // Only process VFIO passthrough devices under /dev/vfio/*.
-            // Skip non-VFIO devices and the legacy VFIO control node (/dev/vfio/vfio).
-            if !host_path.starts_with("/dev/vfio/") || host_path == "/dev/vfio/vfio" {
+            if !is_vfio_passthrough_path(&host_path) {
                 continue;
             }
             let device_port = if is_vfio_ap_device(Path::new(&host_path)) {
@@ -1174,6 +1177,34 @@ impl VirtSandbox {
         self.hypervisor.set_rootless_user(user).await
     }
 
+    /// Make the cold-plugged VFIO groups accessible to a rootless VMM, which
+    /// opens them after dropping its privileges. Cleanup gives them back.
+    async fn grant_rootless_vfio_groups(&self, resources: &[ResourceConfig]) -> Result<()> {
+        if !is_rootless() {
+            return Ok(());
+        }
+        let paths: Vec<String> = resources
+            .iter()
+            .filter_map(|resource| match resource {
+                ResourceConfig::VfioDeviceModern(device) => Some(device.host_path.clone()),
+                _ => None,
+            })
+            .collect();
+        if paths.is_empty() {
+            return Ok(());
+        }
+
+        let uid = self
+            .hypervisor
+            .hypervisor_config()
+            .await
+            .security_info
+            .rootless_user
+            .ok_or_else(|| anyhow!("rootless user must be specified for a rootless VMM"))?
+            .uid;
+        VfioGrants::new().grant(&self.sid, uid, &paths)
+    }
+
     async fn prepare_initdata_device_config(
         &self,
         hypervisor_config: &HypervisorConfig,
@@ -1321,10 +1352,29 @@ impl VirtSandbox {
     }
 }
 
+/// Whether `path` is a VFIO device to pass through: an IOMMU group node
+/// (`/dev/vfio/<group>`) or an iommufd per-device cdev
+/// (`/dev/vfio/devices/vfioX`). The legacy `/dev/vfio/vfio` control node and
+/// nodes outside `/dev/vfio/` (e.g. `/dev/iommu`) are not, although CDI specs
+/// and device plugins list them next to the devices.
+fn is_vfio_passthrough_path(path: &str) -> bool {
+    let Some(rest) = path.strip_prefix("/dev/vfio/") else {
+        return false;
+    };
+    let mut components = rest.split('/');
+    match components.next() {
+        None | Some("") | Some("vfio") => false,
+        Some("devices") => match (components.next(), components.next()) {
+            (Some(name), None) => !name.is_empty(),
+            _ => false,
+        },
+        Some(_) => components.next().is_none(),
+    }
+}
+
 /// Collect VFIO character device nodes (e.g. /dev/vfio/devices/vfio0) that a CDI
 /// runtime injected directly into the OCI spec for the Docker/nerdctl/podman
-/// flow, where there is no kubelet PodResources API to query. The legacy
-/// `/dev/vfio/vfio` control node is skipped as it is not a pass-through device.
+/// flow, where there is no kubelet PodResources API to query.
 fn oci_spec_vfio_device_paths() -> Vec<String> {
     let Ok(spec) = load_oci_spec() else {
         return Vec::new();
@@ -1340,7 +1390,7 @@ fn oci_spec_vfio_device_paths() -> Vec<String> {
         .iter()
         .filter(|dev| dev.typ() == oci::LinuxDeviceType::C)
         .map(|dev| dev.path().display().to_string())
-        .filter(|path| path.starts_with("/dev/vfio") && path != "/dev/vfio/vfio")
+        .filter(|path| is_vfio_passthrough_path(path))
         .collect()
 }
 
@@ -1385,14 +1435,34 @@ impl Sandbox for VirtSandbox {
         // should after hypervisor.prepare_vm
         let resources = self.prepare_for_start_sandbox(id, sandbox_config).await?;
 
-        self.resource_manager
-            .prepare_before_start_vm(resources)
+        self.grant_rootless_vfio_groups(&resources)
             .await
-            .context("set up device before start vm")?;
+            .context("grant VFIO groups to the rootless VMM")?;
 
-        // start vm
-        inner.vmm_start_attempted = true;
-        self.hypervisor.start_vm(10_000).await.context("start vm")?;
+        let started = async {
+            self.resource_manager
+                .prepare_before_start_vm(resources)
+                .await
+                .context("set up device before start vm")?;
+
+            // start vm
+            inner.vmm_start_attempted = true;
+            self.hypervisor.start_vm(10_000).await.context("start vm")
+        }
+        .await;
+        if let Err(err) = started {
+            // The VFIO groups are given back now rather than at cleanup,
+            // which the caller may never ask for. Doing it while a VMM that
+            // failed to boot runs is harmless: it keeps the groups it opened
+            // and cannot open more.
+            if let Err(restore_err) = VfioGrants::new().restore(&self.sid) {
+                error!(
+                    sl!(),
+                    "failed to restore VFIO groups after a failed start: {restore_err:#}"
+                );
+            }
+            return Err(err);
+        }
         info!(sl!(), "start vm");
         self.remember_vmm_process().await;
 
@@ -1782,7 +1852,12 @@ impl Sandbox for VirtSandbox {
         // that arrives later blocks rather than skipping, so the shim does not
         // exit on top of a teardown that is still running.
         let mut steps = self.cleanup_steps.lock().await;
-        if steps.hypervisor && steps.resources && steps.netns && steps.rootless_runtime_dir {
+        if steps.vfio_grants
+            && steps.hypervisor
+            && steps.resources
+            && steps.netns
+            && steps.rootless_runtime_dir
+        {
             return Ok(());
         }
 
@@ -1795,6 +1870,19 @@ impl Sandbox for VirtSandbox {
             .map(|user| user.uid);
 
         let mut errors = Vec::new();
+        // The VMM has exited, so give its VFIO groups back. This must happen
+        // before the hypervisor cleanup deletes the VMM user, as useradd
+        // hands its uid to the next sandbox's VMM user.
+        if !steps.vfio_grants {
+            match VfioGrants::new()
+                .restore(&self.sid)
+                .context("restore VFIO group ownership")
+            {
+                Ok(()) => steps.vfio_grants = true,
+                Err(e) => errors.push(e),
+            }
+        }
+
         info!(sl!(), "resource clean up");
         if !steps.resources {
             match self
@@ -1808,7 +1896,7 @@ impl Sandbox for VirtSandbox {
             }
         }
 
-        if steps.resources && !steps.hypervisor {
+        if steps.resources && steps.vfio_grants && !steps.hypervisor {
             info!(sl!(), "delete hypervisor");
             match self.hypervisor.cleanup().await.context("delete hypervisor") {
                 Ok(()) => steps.hypervisor = true,
@@ -2449,5 +2537,35 @@ mod stop_vm_tests {
         );
         assert!(confirmed.is_cancelled());
         child.wait().await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod vfio_path_tests {
+    use super::is_vfio_passthrough_path;
+
+    #[test]
+    fn only_vfio_passthrough_paths_are_cold_plugged() {
+        let cases = [
+            ("/dev/vfio/16", true),
+            ("/dev/vfio/1", true),
+            ("/dev/vfio/devices/vfio0", true),
+            ("/dev/vfio/devices/vfio12", true),
+            ("/dev/vfio/vfio", false),
+            ("/dev/vfio/vfio/12", false),
+            ("/dev/vfio/devices", false),
+            ("/dev/vfio/devices/", false),
+            ("/dev/vfio/devices/vfio0/x", false),
+            ("/dev/vfio/16/", false),
+            ("/dev/vfio/", false),
+            ("/dev/vfio", false),
+            ("/dev/vfio-test", false),
+            ("/dev/iommu", false),
+            ("/dev/nvidia0", false),
+            ("", false),
+        ];
+        for (path, expected) in cases {
+            assert_eq!(is_vfio_passthrough_path(path), expected, "{path}");
+        }
     }
 }
