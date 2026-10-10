@@ -7,8 +7,8 @@ mod core;
 mod device;
 
 pub use core::{
-    discover_vfio_ap_device, discover_vfio_group_device, is_vfio_ap_device, DeviceAddress,
-    VfioDevice, VfioDeviceType,
+    discover_vfio_ap_device, discover_vfio_group_device, is_vfio_ap_device,
+    vfio_cdev_to_bdf_and_group, DeviceAddress, VfioDevice, VfioDeviceType,
 };
 pub use device::VfioDeviceBase;
 pub use device::VfioDeviceModern;

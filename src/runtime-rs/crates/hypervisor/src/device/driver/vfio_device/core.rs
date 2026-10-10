@@ -728,7 +728,6 @@ fn discover_vfio_device_for_iommu_group(gid: u32, group_devnode: PathBuf) -> Res
 
 /// Resolves an IOMMUFD-style VFIO device cdev (/dev/vfio/devices/vfioX)
 /// back to its PCI BDF and IOMMU group ID.
-#[allow(dead_code)]
 pub fn vfio_cdev_to_bdf_and_group(vfio_cdev: impl AsRef<Path>) -> Result<(String, u32)> {
     let vfio_cdev = vfio_cdev.as_ref();
 

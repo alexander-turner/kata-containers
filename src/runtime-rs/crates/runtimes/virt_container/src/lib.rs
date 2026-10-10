@@ -15,6 +15,7 @@ pub mod health_check;
 pub mod oom;
 pub mod sandbox;
 pub mod sandbox_persist;
+mod vfio_grant;
 pub mod vmm_process;
 
 use std::path::Path;
