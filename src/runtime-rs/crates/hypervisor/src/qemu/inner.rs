@@ -17,7 +17,8 @@ use crate::{
 
 use crate::utils::{
     bytes_to_megs, create_dir_all_with_inherit_owner, enter_netns, get_jailer_root, megs_to_bytes,
-    set_process_credentials, uses_native_ccw_bus, vm_cleanup,
+    memlock_limit_with_headroom, set_memlock_rlimit, set_process_credentials, uses_native_ccw_bus,
+    vm_cleanup,
 };
 
 use anyhow::{anyhow, Context, Result};
@@ -54,7 +55,6 @@ use tokio::{
 };
 
 const VSOCK_SCHEME: &str = "vsock";
-const MEMLOCK_HEADROOM_DIVISOR: u64 = 10;
 
 fn open_qemu_pidfd(pid: u32) -> Result<Arc<OwnedFd>> {
     let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
@@ -1118,22 +1118,6 @@ fn check_bpf_enabled_with<ReadStatus, LogWarning>(
     }
 }
 
-fn memlock_limit_with_headroom(guest_memory: u64) -> u64 {
-    guest_memory.saturating_add(guest_memory / MEMLOCK_HEADROOM_DIVISOR)
-}
-
-fn set_memlock_rlimit(memlock_limit: u64) -> Result<()> {
-    let limit = libc::rlimit {
-        rlim_cur: memlock_limit,
-        rlim_max: memlock_limit,
-    };
-    let result = unsafe { libc::setrlimit(libc::RLIMIT_MEMLOCK, &limit) };
-    if result != 0 {
-        return Err(std::io::Error::last_os_error()).context("set RLIMIT_MEMLOCK failed");
-    }
-    Ok(())
-}
-
 async fn try_open_qemu_console(console_socket_path: &Path) -> Result<UnixStream> {
     const DEADLINE_SECS: u64 = 5;
     let deadline = Instant::now()
@@ -1684,12 +1668,6 @@ mod tests {
             .await
             .unwrap()
             .is_network_device_hotplug_supported());
-    }
-
-    #[test]
-    fn test_memlock_limit_adds_headroom() {
-        assert_eq!(memlock_limit_with_headroom(10 * 1024), 11 * 1024);
-        assert_eq!(memlock_limit_with_headroom(u64::MAX), u64::MAX);
     }
 
     #[rstest]

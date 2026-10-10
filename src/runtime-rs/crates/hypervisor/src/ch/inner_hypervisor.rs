@@ -7,6 +7,7 @@ use super::inner::CloudHypervisorInner;
 use crate::ch::utils::get_api_socket_path;
 use crate::ch::utils::get_rootless_symlink_sandbox_path;
 use crate::ch::utils::get_vsock_path;
+use crate::device::DeviceType;
 use crate::kernel_param::KernelParams;
 use crate::selinux;
 use crate::utils::create_dir_all_with_inherit_owner;
@@ -14,6 +15,7 @@ use crate::utils::remove_dir_all_if_exists;
 use crate::utils::set_process_credentials;
 use crate::utils::vm_cleanup;
 use crate::utils::{bytes_to_megs, get_jailer_root, get_sandbox_path, megs_to_bytes};
+use crate::utils::{memlock_limit_with_headroom, set_memlock_rlimit};
 use crate::MemoryConfig;
 use crate::VM_ROOTFS_DRIVER_BLK;
 use crate::{VcpuThreadIds, VmmState};
@@ -513,6 +515,11 @@ impl CloudHypervisorInner {
         } else {
             None
         };
+        let memlock_limit = rootless_vfio_memlock_limit(
+            user.is_some(),
+            &self.pending_devices,
+            self.config.memory_info.default_memory,
+        );
 
         unsafe {
             let selinux_label = self.config.security_info.selinux_label.clone();
@@ -534,6 +541,10 @@ impl CloudHypervisorInner {
                     }
                 }
                 if let Some(user) = &user {
+                    if let Some(limit) = memlock_limit {
+                        set_memlock_rlimit(limit)
+                            .map_err(|err| std::io::Error::other(format!("{err:#}")))?;
+                    }
                     set_process_credentials(user)
                         .map_err(|err| std::io::Error::other(format!("{err:#}")))?;
                 }
@@ -1105,6 +1116,22 @@ fn get_ch_vcpu_tids(proc_path: &str) -> Result<HashMap<u32, u32>> {
     Ok(vcpus)
 }
 
+/// The RLIMIT_MEMLOCK a rootless VMM needs, if any.
+///
+/// Cold-plugged VFIO devices make Cloud Hypervisor pin all guest memory at
+/// boot, which the VMM user may only do up to its RLIMIT_MEMLOCK, often as
+/// low as 8 MiB. A privileged VMM is not limited.
+fn rootless_vfio_memlock_limit(
+    rootless: bool,
+    pending_devices: &[DeviceType],
+    guest_memory_mib: u32,
+) -> Option<u64> {
+    let has_vfio = pending_devices
+        .iter()
+        .any(|device| matches!(device, DeviceType::Vfio(_) | DeviceType::VfioModern(_)));
+    (rootless && has_vfio).then(|| memlock_limit_with_headroom(megs_to_bytes(guest_memory_mib)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1113,6 +1140,34 @@ mod tests {
 
     use std::fs::{self, File};
     use tempfile::Builder;
+
+    #[test]
+    fn test_rootless_vfio_memlock_limit() {
+        use crate::device::driver::{NetworkDevice, VfioDevice, VfioDeviceModern};
+        use std::sync::Arc;
+        use tokio::sync::Mutex;
+
+        let legacy = || DeviceType::Vfio(VfioDevice::default());
+        let modern = || DeviceType::VfioModern(Arc::new(Mutex::new(VfioDeviceModern::default())));
+        let network = || DeviceType::Network(NetworkDevice::default());
+        // 2 GiB of guest memory plus 10% headroom.
+        let limit = Some(2048 * 1024 * 1024 * 11 / 10);
+
+        let cases = [
+            (true, vec![legacy()], limit),
+            (true, vec![network(), modern()], limit),
+            (true, vec![network()], None),
+            (true, vec![], None),
+            (false, vec![legacy(), modern()], None),
+        ];
+        for (rootless, devices, expected) in cases {
+            assert_eq!(
+                rootless_vfio_memlock_limit(rootless, &devices, 2048),
+                expected,
+                "rootless={rootless} devices={devices:?}"
+            );
+        }
+    }
 
     #[actix_rt::test]
     async fn test_network_device_hotplug_capability() {

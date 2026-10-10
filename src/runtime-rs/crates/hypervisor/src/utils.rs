@@ -153,6 +153,28 @@ where
     Ok(())
 }
 
+const MEMLOCK_HEADROOM_DIVISOR: u64 = 10;
+
+/// VFIO pins all guest memory, which an unprivileged VMM may only do up to
+/// its RLIMIT_MEMLOCK. Allow for mappings that are not guest memory too.
+pub fn memlock_limit_with_headroom(guest_memory: u64) -> u64 {
+    guest_memory.saturating_add(guest_memory / MEMLOCK_HEADROOM_DIVISOR)
+}
+
+/// Set RLIMIT_MEMLOCK of the calling process. Raising it needs
+/// CAP_SYS_RESOURCE, so call it in the VMM child before dropping credentials.
+pub fn set_memlock_rlimit(memlock_limit: u64) -> Result<()> {
+    let limit = libc::rlimit {
+        rlim_cur: memlock_limit,
+        rlim_max: memlock_limit,
+    };
+    let result = unsafe { libc::setrlimit(libc::RLIMIT_MEMLOCK, &limit) };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error()).context("set RLIMIT_MEMLOCK failed");
+    }
+    Ok(())
+}
+
 // Return the non-root owning group that grants `required_permissions`, or
 // None when the resource's other permissions already grant that access.
 fn select_rootless_access_group(
@@ -744,6 +766,7 @@ mod tests {
     use crate::utils::first_valid_executable_path;
 
     use super::create_fds;
+    use super::memlock_limit_with_headroom;
     use super::remove_dir_all_if_exists;
     use super::set_process_credentials_with;
     use super::vmm_user_runtime_dir;
@@ -751,6 +774,12 @@ mod tests {
     use super::{
         authorize_rootless_resource_access, authorize_rootless_socket, select_rootless_access_group,
     };
+
+    #[test]
+    fn test_memlock_limit_adds_headroom() {
+        assert_eq!(memlock_limit_with_headroom(10 * 1024), 11 * 1024);
+        assert_eq!(memlock_limit_with_headroom(u64::MAX), u64::MAX);
+    }
 
     fn rootless_user() -> RootlessUser {
         RootlessUser {
