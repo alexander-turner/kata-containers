@@ -137,7 +137,7 @@ pub async fn install_artifacts(config: &Config, container_runtime: &str) -> Resu
     // Not tied to any shim, so reconcile separately: turning debug off on a
     // redeploy must also remove it.
     reconcile_debug_tools(config, &mut extracted)?;
-    install_versions_yaml(config)?;
+    install_version_metadata(config)?;
 
     set_executable_permissions(&config.host_install_dir)?;
 
@@ -766,9 +766,6 @@ fn copy_artifacts(src: &str, dst: &str) -> Result<()> {
     Ok(())
 }
 
-/// Path to the versions.yaml file inside the kata-deploy container image.
-const VERSIONS_YAML_PATH: &str = "/opt/kata-artifacts/versions.yaml";
-
 /// Path to the shim-components.json manifest inside the kata-deploy container image.
 const SHIM_COMPONENTS_PATH: &str = "/opt/kata-artifacts/shim-components.json";
 
@@ -792,8 +789,29 @@ fn current_arch() -> &'static str {
     }
 }
 
+/// Every base configuration whose component payload must be installed.
+///
+/// A custom runtime can use a base whose shim has no RuntimeClass of its own,
+/// so its base belongs here even when it is absent from `shims_for_arch`.
+fn component_base_configs(config: &Config) -> Vec<&str> {
+    let mut bases: Vec<_> = config
+        .shims_for_arch
+        .iter()
+        .map(String::as_str)
+        .chain(
+            config
+                .custom_runtimes
+                .iter()
+                .map(|runtime| runtime.base_config.as_str()),
+        )
+        .collect();
+    bases.sort_unstable();
+    bases.dedup();
+    bases
+}
+
 /// Parse shim-components.json and return the union of component tarball names
-/// required by all shims listed in `config.shims_for_arch` for the current arch.
+/// required by all enabled shims and custom-runtime bases for the current arch.
 fn collect_required_tarballs(config: &Config) -> Result<HashSet<String>> {
     let arch = current_arch();
     let json_str = fs::read_to_string(SHIM_COMPONENTS_PATH)
@@ -805,9 +823,9 @@ fn collect_required_tarballs(config: &Config) -> Result<HashSet<String>> {
         .ok_or_else(|| anyhow::anyhow!("shim-components.json is missing the 'shims' object"))?;
 
     let mut required: HashSet<String> = HashSet::new();
-    for shim in &config.shims_for_arch {
+    for shim in component_base_configs(config) {
         match shims_map
-            .get(shim.as_str())
+            .get(shim)
             .and_then(|v| v.get(arch))
             .and_then(|v| v.as_array())
         {
@@ -986,29 +1004,30 @@ fn extract_tarball(tarball_path: &Path, dest_dir: &str) -> Result<()> {
     Ok(())
 }
 
-/// Copy versions.yaml from the kata-deploy image into the host installation directory.
-///
-/// versions.yaml was previously included in the merged kata-static.tar.zst tarball.
-/// After the switch to per-component tarballs, it must be copied explicitly.
-fn install_versions_yaml(config: &Config) -> Result<()> {
-    let src = Path::new(VERSIONS_YAML_PATH);
-    if !src.exists() {
-        log::warn!(
-            "versions.yaml not found at {}; skipping installation",
-            VERSIONS_YAML_PATH
-        );
-        return Ok(());
-    }
+/// Copy version metadata from the kata-deploy image into the host installation directory.
+fn install_version_metadata(config: &Config) -> Result<()> {
+    for name in ["VERSION", "versions.yaml"] {
+        let src = Path::new("/opt/kata-artifacts").join(name);
+        if !src.exists() {
+            log::warn!(
+                "{} not found at {}; skipping installation",
+                name,
+                src.display()
+            );
+            continue;
+        }
 
-    let dest = Path::new(&config.host_install_dir).join("versions.yaml");
-    fs::copy(src, &dest).with_context(|| {
-        format!(
-            "Failed to copy versions.yaml from {} to {}",
-            src.display(),
-            dest.display()
-        )
-    })?;
-    info!("Installed versions.yaml to {}", dest.display());
+        let dest = Path::new(&config.host_install_dir).join(name);
+        fs::copy(&src, &dest).with_context(|| {
+            format!(
+                "Failed to copy {} from {} to {}",
+                name,
+                src.display(),
+                dest.display()
+            )
+        })?;
+        info!("Installed {} to {}", name, dest.display());
+    }
     Ok(())
 }
 
@@ -1032,8 +1051,8 @@ fn extract_component_tarballs(config: &Config, extracted: &mut HashSet<String>) 
     }
 
     info!(
-        "Component tarballs required for shims [{}]: {:?}",
-        config.shims_for_arch.join(", "),
+        "Component tarballs required for runtime bases [{}]: {:?}",
+        component_base_configs(config).join(", "),
         {
             let mut sorted: Vec<_> = required.iter().collect();
             sorted.sort();
@@ -2630,6 +2649,36 @@ pub(crate) mod tests {
         assert!(content.contains("[runtime]"));
         assert!(content.contains("[agent.kata]"));
         assert!(content.contains("debug_console_enabled = true"));
+    }
+
+    #[test]
+    fn test_component_base_configs_include_custom_runtime_bases() {
+        let mut config = test_config("qemu", "/tmp");
+        config.custom_runtimes = vec![
+            crate::config::CustomRuntime {
+                handler: "kata-confidential".to_string(),
+                base_config: "qemu-coco-dev".to_string(),
+                drop_in_file: None,
+                containerd_snapshotter: None,
+                crio_pull_type: None,
+                debug_variant: false,
+                devkit: false,
+            },
+            crate::config::CustomRuntime {
+                handler: "kata-qemu-debug".to_string(),
+                base_config: "qemu".to_string(),
+                drop_in_file: None,
+                containerd_snapshotter: None,
+                crio_pull_type: None,
+                debug_variant: true,
+                devkit: false,
+            },
+        ];
+
+        assert_eq!(
+            component_base_configs(&config),
+            vec!["qemu", "qemu-coco-dev"]
+        );
     }
 
     /// Shared with other modules' tests: Config has no Default, and one

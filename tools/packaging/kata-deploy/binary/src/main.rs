@@ -111,6 +111,27 @@ enum Action {
     InternalPostInstallWait,
 }
 
+impl Action {
+    fn validate_install_config(&self, config: &config::Config) -> Result<()> {
+        match self {
+            Self::Install
+            | Self::InstallStageLoadKernelModules
+            | Self::InstallStageHostCheck
+            | Self::InstallStageRootlessDevices
+            | Self::InstallStageArtifacts
+            | Self::InstallStageCri => config.validate_nvrc_enable_dcgm(),
+            // The SELinux stage is shared by install and cleanup. It must be
+            // able to restore the policy even when installation was rejected.
+            Self::InstallStageSelinuxPolicy
+            | Self::Cleanup
+            | Self::CleanupStageRevertCri
+            | Self::CleanupStageRemoveArtifacts
+            | Self::Reset
+            | Self::InternalPostInstallWait => Ok(()),
+        }
+    }
+}
+
 /// Node label applied to mark a node as kata-capable. Shared across the
 /// install/cleanup label stages so the key stays consistent.
 const KATA_RUNTIME_LABEL: &str = "katacontainers.io/kata-runtime";
@@ -213,6 +234,7 @@ async fn run() -> Result<()> {
     }
 
     let config = config::Config::from_env()?;
+    args.action.validate_install_config(&config)?;
     if matches!(
         args.action,
         Action::InstallStageSelinuxPolicy
@@ -1893,6 +1915,7 @@ async fn install_stage_artifacts(
     }
 
     if runtime != "crio" {
+        artifacts::snapshotters::remove_unrequested_nydus_snapshotter(config).await?;
         if let Some(snapshotters) = config.experimental_setup_snapshotter.as_ref() {
             for snapshotter in snapshotters {
                 artifacts::snapshotters::install_snapshotter(snapshotter, config, runtime).await?;
@@ -1964,6 +1987,7 @@ async fn install_stage_cri(config: &config::Config, runtime: &str, staged: bool)
     runtime::configure_cri_runtime(config, runtime).await?;
 
     if runtime != "crio" {
+        artifacts::snapshotters::unconfigure_unrequested_nydus_snapshotter(config, runtime).await?;
         if let Some(snapshotters) = config.experimental_setup_snapshotter.as_ref() {
             for snapshotter in snapshotters {
                 artifacts::snapshotters::configure_snapshotter(snapshotter, runtime, config)
@@ -2300,6 +2324,7 @@ async fn cleanup(config: &config::Config, runtime: &str) -> Result<()> {
                 info!("No experimental snapshotters to uninstall");
             }
         }
+        artifacts::snapshotters::remove_unrequested_nydus_snapshotter(config).await?;
     } else {
         info!("Skipping snapshotter uninstall on CRI-O (containerd-specific feature)");
     }
@@ -2343,6 +2368,7 @@ async fn cleanup_stage_revert_cri(
                 artifacts::snapshotters::uninstall_snapshotter(snapshotter, config).await?;
             }
         }
+        artifacts::snapshotters::remove_unrequested_nydus_snapshotter(config).await?;
     }
 
     if !cri_configuration_present(config, runtime).await {
@@ -2454,6 +2480,28 @@ mod tests {
     use super::*;
     use clap::ValueEnum;
     use rstest::rstest;
+
+    #[rstest]
+    #[case(Action::Install, true)]
+    #[case(Action::InstallStageLoadKernelModules, true)]
+    #[case(Action::InstallStageHostCheck, true)]
+    #[case(Action::InstallStageRootlessDevices, true)]
+    #[case(Action::InstallStageArtifacts, true)]
+    #[case(Action::InstallStageCri, true)]
+    #[case(Action::InstallStageSelinuxPolicy, false)]
+    #[case(Action::Cleanup, false)]
+    #[case(Action::CleanupStageRevertCri, false)]
+    #[case(Action::CleanupStageRemoveArtifacts, false)]
+    #[case(Action::Reset, false)]
+    #[case(Action::InternalPostInstallWait, false)]
+    fn dcgm_validation_only_blocks_install(#[case] action: Action, #[case] rejects: bool) {
+        let mut config = artifacts::install::tests::test_config("qemu", "/opt/kata");
+        config.nvrc_enable_dcgm = vec!["qemu-nvidia-cpu-runtime-rs".to_string()];
+        assert_eq!(action.validate_install_config(&config).is_err(), rejects);
+
+        config.nvrc_enable_dcgm.clear();
+        assert!(action.validate_install_config(&config).is_ok());
+    }
 
     /// Every staged subcommand name parses into the expected `Action` variant.
     /// Keep this in sync with the `#[clap(name = ...)]` attributes above.

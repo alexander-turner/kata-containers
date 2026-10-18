@@ -1315,6 +1315,17 @@ pub struct SecurityInfo {
     #[serde(default)]
     pub disable_seccomp: bool,
 
+    /// Enables Landlock for the VMM (Cloud Hypervisor only).
+    ///
+    /// From vm.create on, the VMM thread and the threads it starts can open
+    /// only the files the VMM needs: the guest kernel and image, its own
+    /// sockets, and the disks this VM is given. Every disk but the boot image
+    /// is staged under the sandbox directory, so a disk added after boot is
+    /// covered too. VFIO and virtio-fs hot-plug and VM templates are
+    /// refused.
+    #[serde(default)]
+    pub enable_landlock: bool,
+
     /// Enables confidential guest support.
     ///
     /// Toggling this setting may activate different hardware features, ranging from
@@ -1825,6 +1836,24 @@ impl Hypervisor {
     pub fn validate_jailer_path<P: AsRef<Path>>(&self, path: P) -> Result<()> {
         validate_path_pattern(&self.valid_jailer_paths, path)
     }
+
+    /// Record the SELinux label for the VM's host processes. The label is
+    /// ignored when SELinux handling is disabled.
+    pub fn set_selinux_label(&mut self, label: Option<String>) {
+        if !self.disable_selinux {
+            self.security_info.selinux_label = label;
+        }
+    }
+
+    /// SELinux label to apply to the VM's host processes, or `None` when
+    /// SELinux handling is disabled or no label has been assigned.
+    pub fn effective_selinux_label(&self) -> Option<&str> {
+        if self.disable_selinux {
+            None
+        } else {
+            self.security_info.selinux_label.as_deref()
+        }
+    }
 }
 
 impl ConfigOps for Hypervisor {
@@ -1983,6 +2012,35 @@ mod tests {
 
         assert!(get_hypervisor_plugin("dragonball").is_some());
         assert!(get_hypervisor_plugin("dragonball2").is_none());
+    }
+
+    #[test]
+    fn test_effective_selinux_label() {
+        let mut hypervisor = Hypervisor::default();
+        assert_eq!(hypervisor.effective_selinux_label(), None);
+
+        hypervisor.security_info.selinux_label = Some("label".to_string());
+        assert_eq!(hypervisor.effective_selinux_label(), Some("label"));
+
+        hypervisor.disable_selinux = true;
+        assert_eq!(hypervisor.effective_selinux_label(), None);
+    }
+
+    #[test]
+    fn test_set_selinux_label() {
+        let mut hypervisor = Hypervisor::default();
+        hypervisor.set_selinux_label(Some("label".to_string()));
+        assert_eq!(
+            hypervisor.security_info.selinux_label.as_deref(),
+            Some("label")
+        );
+
+        let mut hypervisor = Hypervisor {
+            disable_selinux: true,
+            ..Default::default()
+        };
+        hypervisor.set_selinux_label(Some("label".to_string()));
+        assert_eq!(hypervisor.security_info.selinux_label, None);
     }
 
     #[test]

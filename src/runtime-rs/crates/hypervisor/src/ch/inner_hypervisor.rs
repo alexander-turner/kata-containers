@@ -4,13 +4,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::inner::CloudHypervisorInner;
+use crate::ch::landlock;
 use crate::ch::utils::get_api_socket_path;
-use crate::ch::utils::get_rootless_symlink_sandbox_path;
 use crate::ch::utils::get_vsock_path;
 use crate::kernel_param::KernelParams;
 use crate::selinux;
 use crate::utils::create_dir_all_with_inherit_owner;
-use crate::utils::remove_dir_all_if_exists;
 use crate::utils::set_process_credentials;
 use crate::utils::vm_cleanup;
 use crate::utils::{bytes_to_megs, get_jailer_root, get_sandbox_path, megs_to_bytes};
@@ -484,6 +483,10 @@ impl CloudHypervisorInner {
             cmd.args(["--seccomp", "false"]);
         }
 
+        // With enable_landlock, vm.create confines the VMM thread and every
+        // thread it starts later. The threads already running stay unconfined
+        // until Cloud Hypervisor accepts --landlock without --kernel.
+
         let netns = self.netns.clone();
         if let Some(netns_ref) = &self.netns {
             info!(sl!(), "set netns for vmm : {:?}", netns_ref);
@@ -503,24 +506,17 @@ impl CloudHypervisorInner {
             None
         };
 
+        selinux::apply_exec_label(
+            &mut cmd,
+            self.config.effective_selinux_label(),
+            "Cloud Hypervisor",
+        )?;
+
         unsafe {
-            let selinux_label = self.config.security_info.selinux_label.clone();
             let _pre = cmd.pre_exec(move || {
                 if let Some(netns_path) = &netns {
                     let netns_fd = std::fs::File::open(netns_path);
                     let _ = setns(&netns_fd?, CloneFlags::CLONE_NEWNET).context("set netns failed");
-                }
-                if let Some(label) = selinux_label.as_ref() {
-                    if let Err(e) = selinux::set_exec_label(label) {
-                        error!(sl!(), "Failed to set SELinux label in child process: {}", e);
-                        // Don't return error here to avoid breaking the process startup
-                        // Log the error and continue
-                    } else {
-                        info!(
-                            sl!(),
-                            "Successfully set SELinux label in child process: {}", &label
-                        );
-                    }
                 }
                 if let Some(user) = &user {
                     set_process_credentials(user)
@@ -655,12 +651,7 @@ impl CloudHypervisorInner {
 
         self.netns = netns;
 
-        if !self.hypervisor_config().disable_selinux {
-            if let Some(label) = selinux_label.as_ref() {
-                self.config.security_info.selinux_label = Some(label.to_string());
-                selinux::set_exec_label(label).context("failed to set SELinux process label")?;
-            }
-        }
+        self.config.set_selinux_label(selinux_label);
 
         Ok(())
     }
@@ -683,6 +674,19 @@ impl CloudHypervisorInner {
 
         create_dir_all_with_inherit_owner(&self.run_dir, 0o750)
             .with_context(|| anyhow!("failed to create sandbox directory {}", self.run_dir))?;
+
+        if self.config.security_info.enable_landlock {
+            // Checked before the VMM starts: a template's saved config carries
+            // the Landlock rules of the sandbox that made it, and a confined
+            // VMM cannot write a snapshot to the template directory.
+            let template = &self.config.vm_template;
+            if template.boot_from_template || template.boot_to_be_template {
+                return Err(anyhow!(
+                    "enable_landlock cannot be combined with a VM template"
+                ));
+            }
+            landlock::create_stage_dirs(&self.run_dir)?;
+        }
 
         if !self.jailer_root.is_empty() {
             create_dir_all_with_inherit_owner(self.jailer_root.as_str(), 0o750)
@@ -798,10 +802,14 @@ impl CloudHypervisorInner {
 
     pub(crate) async fn cleanup(&self) -> Result<()> {
         info!(sl!(), "CloudHypervisor::cleanup()");
-        if is_rootless() {
-            remove_dir_all_if_exists(get_rootless_symlink_sandbox_path(self.id.as_str()).as_str())?;
+        let unstaged = landlock::unstage_all(self.vm_path.as_str());
+        if !unstaged.is_empty() {
+            return Err(anyhow!(
+                "staged disks still mounted, so the sandbox directory is kept: {}",
+                unstaged.join(", ")
+            ));
         }
-        vm_cleanup(&self.config, self.vm_path.as_str())
+        vm_cleanup(&self.config, &self.id, self.vm_path.as_str())
     }
 
     pub(crate) async fn resize_vcpu(

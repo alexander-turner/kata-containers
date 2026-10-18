@@ -5,11 +5,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::inner::CloudHypervisorInner;
-use crate::ch::utils::get_rootless_symlink_sandbox_jailer_root;
+use crate::ch::landlock;
 use crate::device::pci_path::PciPath;
 use crate::device::DeviceType;
-use crate::utils::create_dir_all_with_inherit_owner;
 use crate::utils::open_named_tuntap;
+use crate::utils::{check_unix_socket_path_len, link_rootless_vmm_socket};
 use crate::HybridVsockDevice;
 use crate::NetworkConfig;
 use crate::NetworkDevice;
@@ -40,7 +40,6 @@ use safe_path::scoped_join;
 use std::convert::TryFrom;
 use std::os::fd::AsRawFd;
 use std::os::fd::IntoRawFd;
-use std::os::unix::fs::symlink;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -94,6 +93,16 @@ impl CloudHypervisorInner {
     }
 
     async fn handle_add_device(&mut self, device: DeviceType) -> Result<DeviceType> {
+        // A confined VMM's rules are fixed at vm.create and name no VFIO group
+        // or virtio-fs socket, so a hot-plug of either cannot open its files.
+        if self.config.security_info.enable_landlock
+            && matches!(device, DeviceType::ShareFs(_) | DeviceType::Vfio(_))
+        {
+            return Err(anyhow!(
+                "cannot hot-plug {:?} into a VMM confined with enable_landlock",
+                device
+            ));
+        }
         match device {
             DeviceType::ShareFs(sharefs) => self.handle_share_fs_device(sharefs).await,
             DeviceType::HybridVsock(hvsock) => self.handle_hvsock_device(hvsock).await,
@@ -127,7 +136,11 @@ impl CloudHypervisorInner {
             DeviceType::Vfio(vfiodev) => self.inner_remove_device(vfiodev.device_id.as_str()).await,
             DeviceType::BlockModern(blockdev) => {
                 let device_id = blockdev.lock().await.device_id.clone();
-                self.inner_remove_device(device_id.as_str()).await
+                self.inner_remove_device(device_id.as_str()).await?;
+                if self.config.security_info.enable_landlock {
+                    landlock::unstage_device(&self.vm_path, &device_id)?;
+                }
+                Ok(())
             }
             _ => Ok(()),
         }
@@ -192,7 +205,7 @@ impl CloudHypervisorInner {
 
         let device_config = DeviceConfig {
             path: PathBuf::from(sysfsdev),
-            iommu: false,
+            iommu: false.into(),
             ..Default::default()
         };
 
@@ -302,6 +315,27 @@ impl CloudHypervisorInner {
         Ok(disk_config)
     }
 
+    /// Under Landlock, point `disk_config` at a staged copy of the disk below
+    /// a directory the VMM's rules cover.
+    fn stage_disk_for_vmm(
+        &self,
+        device_id: &str,
+        config: &BlockConfigModern,
+        disk_config: &mut DiskConfig,
+    ) -> Result<()> {
+        if !self.config.security_info.enable_landlock {
+            return Ok(());
+        }
+        let staged = landlock::stage_disk(
+            &self.vm_path,
+            device_id,
+            &config.path_on_host,
+            config.is_readonly,
+        )?;
+        disk_config.path = Some(staged);
+        Ok(())
+    }
+
     fn is_vm_boot_file(&self, path: &str) -> bool {
         let boot_info = &self.config.boot_info;
 
@@ -319,9 +353,23 @@ impl CloudHypervisorInner {
             (dev.device_id.clone(), dev.config.clone())
         };
 
-        let disk_config = self.make_disk_config(&config)?;
+        let mut disk_config = self.make_disk_config(&config)?;
 
-        let response = cloud_hypervisor_vm_blockdev_add(&self.api_socket, disk_config).await?;
+        let added = match self.stage_disk_for_vmm(&device_id, &config, &mut disk_config) {
+            Ok(()) => cloud_hypervisor_vm_blockdev_add(&self.api_socket, disk_config).await,
+            Err(e) => Err(e),
+        };
+        let response = match added {
+            Ok(response) => response,
+            Err(e) => {
+                if self.config.security_info.enable_landlock {
+                    if let Err(unstage_err) = landlock::unstage_device(&self.vm_path, &device_id) {
+                        error!(sl!(), "failed to unstage disk: {:?}", unstage_err);
+                    }
+                }
+                return Err(e);
+            }
+        };
 
         if let Some(detail) = response {
             debug!(sl!(), "blockdev add response: {:?}", detail);
@@ -388,49 +436,12 @@ impl CloudHypervisorInner {
                 DeviceType::ShareFs(dev) => {
                     let settings = ShareFsSettings::new(dev.config, self.vm_path.clone());
 
-                    let fs_cfg = if is_rootless() {
-                        // TODO: Replace this symlink workaround if a better approach for rootless socket paths appears.
-                        // In rootless mode the virtiofsd.sock lives under the rootless directory,
-                        // and its full path can exceed the 108-byte Unix domain socket limit.
-                        // To ensure the cloud-hypervisor VMM can connect to virtiofsd, create a
-                        // short symlink inside the rootless directory and point the VMM at it.
-                        let mut fs_cfg = FsConfig::try_from(settings)?;
-                        let rootless_symlink_sanbox_jailer_root =
-                            get_rootless_symlink_sandbox_jailer_root(self.id.as_str());
-
-                        create_dir_all_with_inherit_owner(
-                            rootless_symlink_sanbox_jailer_root.as_str(),
-                            0x750,
-                        )
-                        .map_err(|e| {
-                            anyhow!(
-                                "failed to create rootless sharefs symlink jailer root dir: {}",
-                                e
-                            )
-                        })?;
-                        let virtiofsd_name = fs_cfg.socket.file_name().ok_or_else(|| {
-                            anyhow!(
-                                "failed to get virtiofsd socket file name from path: {:?}",
-                                fs_cfg.socket
-                            )
-                        })?;
-                        let virtiofsd_symlink_path =
-                            PathBuf::from(rootless_symlink_sanbox_jailer_root.as_str())
-                                .join(virtiofsd_name);
-
-                        symlink(&fs_cfg.socket, &virtiofsd_symlink_path).map_err(|e| {
-                            anyhow!(
-                                "failed to create symlink for rootless sharefs socket: {}",
-                                e
-                            )
-                        })?;
-
-                        fs_cfg.socket = virtiofsd_symlink_path;
-
-                        fs_cfg
-                    } else {
-                        FsConfig::try_from(settings)?
-                    };
+                    let mut fs_cfg = FsConfig::try_from(settings)?;
+                    if is_rootless() {
+                        fs_cfg.socket = link_rootless_vmm_socket(&self.id, &fs_cfg.socket)
+                            .context("link rootless virtiofsd socket")?;
+                    }
+                    check_unix_socket_path_len(&fs_cfg.socket)?;
 
                     shared_fs_devices.push(fs_cfg);
                 }
@@ -477,7 +488,7 @@ impl CloudHypervisorInner {
                     let sysfsdev = primary_device.sysfs_path.clone();
                     let device_config = DeviceConfig {
                         path: PathBuf::from(sysfsdev),
-                        iommu: false,
+                        iommu: false.into(),
                         ..Default::default()
                     };
                     info!(
@@ -498,7 +509,10 @@ impl CloudHypervisorInner {
                     }
                 }
                 DeviceType::BlockModern(block_device) => {
-                    let config = block_device.lock().await.config.clone();
+                    let (device_id, config) = {
+                        let dev = block_device.lock().await;
+                        (dev.device_id.clone(), dev.config.clone())
+                    };
 
                     if self.is_vm_boot_file(&config.path_on_host) {
                         // Already handled through the VmConfig payload/disks.
@@ -507,7 +521,9 @@ impl CloudHypervisorInner {
 
                     info!(sl!(), "cold-plugging block device {:?}", &config);
 
-                    boot_disks.push(self.make_disk_config(&config)?);
+                    let mut disk_config = self.make_disk_config(&config)?;
+                    self.stage_disk_for_vmm(&device_id, &config, &mut disk_config)?;
+                    boot_disks.push(disk_config);
                 }
                 _ => continue,
             }
@@ -573,7 +589,8 @@ impl TryFrom<BlockConfigModern> for DiskConfig {
                 0 => DEFAULT_DISK_QUEUE_SIZE,
                 sz => u16::try_from(sz)?,
             },
-            sparse: blkcfg.discard_unmap,
+            // CLH fallocates writable disks to their full logical size when sparse is false.
+            sparse: true,
             image_type: ImageType::Raw,
             ..Default::default()
         };

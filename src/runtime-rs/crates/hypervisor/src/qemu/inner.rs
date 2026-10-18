@@ -16,8 +16,9 @@ use crate::{
 };
 
 use crate::utils::{
-    bytes_to_megs, create_dir_all_with_inherit_owner, enter_netns, get_jailer_root, megs_to_bytes,
-    set_process_credentials, uses_native_ccw_bus, vm_cleanup,
+    bytes_to_megs, check_unix_socket_path_len, create_dir_all_with_inherit_owner, enter_netns,
+    get_jailer_root, link_rootless_vmm_socket, megs_to_bytes, set_process_credentials,
+    uses_native_ccw_bus, vm_cleanup,
 };
 
 use anyhow::{anyhow, Context, Result};
@@ -37,7 +38,7 @@ use std::convert::{TryFrom, TryInto};
 use std::fs;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
@@ -123,12 +124,7 @@ impl QemuInner {
         self.id = id.to_string();
         self.netns = netns;
 
-        if !self.hypervisor_config().disable_selinux {
-            if let Some(label) = selinux_label.as_ref() {
-                self.config.security_info.selinux_label = Some(label.to_string());
-                selinux::set_exec_label(label).context("failed to set SELinux process label")?;
-            }
-        }
+        self.config.set_selinux_label(selinux_label);
 
         let vm_path =
             Path::new(prefix_with_rootless_dir(KATA_PATH).as_str()).join(self.id.as_str());
@@ -158,8 +154,14 @@ impl QemuInner {
             match device {
                 DeviceType::ShareFs(share_fs_dev) => {
                     if share_fs_dev.config.fs_type == "virtio-fs" {
+                        let mut sock_path = PathBuf::from(&share_fs_dev.config.sock_path);
+                        if is_rootless() {
+                            sock_path = link_rootless_vmm_socket(&self.id, &sock_path)
+                                .context("link rootless virtiofsd socket")?;
+                        }
+                        check_unix_socket_path_len(&sock_path)?;
                         cmdline.add_virtiofs_share(
-                            &share_fs_dev.config.sock_path,
+                            &sock_path.to_string_lossy(),
                             &share_fs_dev.config.mount_tag,
                             share_fs_dev.config.queue_size,
                         );
@@ -445,23 +447,12 @@ impl QemuInner {
             None
         };
 
-        // we need move the qemu process into Network Namespace and set SELinux label.
+        selinux::apply_exec_label(&mut command, self.config.effective_selinux_label(), "QEMU")?;
+
+        // Move the QEMU child into its network namespace and set credentials.
         unsafe {
-            let selinux_label = self.config.security_info.selinux_label.clone();
             let _pre_exec = command.pre_exec(move || {
                 let _ = enter_netns(&netns);
-                if let Some(label) = selinux_label.as_ref() {
-                    if let Err(e) = selinux::set_exec_label(label) {
-                        error!(sl!(), "Failed to set SELinux label in child process: {}", e);
-                        // Don't return error here to avoid breaking the process startup
-                        // Log the error and continue
-                    } else {
-                        info!(
-                            sl!(),
-                            "Successfully set SELinux label in child process: {}", &label
-                        );
-                    }
-                }
                 if let Some(user) = &user {
                     if let Some(limit) = memlock_limit {
                         set_memlock_rlimit(limit)
@@ -475,7 +466,10 @@ impl QemuInner {
             });
         }
 
-        let mut qemu_process = command.stderr(Stdio::piped()).spawn()?;
+        let mut qemu_process = command
+            .stderr(Stdio::piped())
+            .spawn()
+            .context("spawn QEMU")?;
         self.qemu_pidfd = qemu_process
             .id()
             .and_then(|pid| match open_qemu_pidfd(pid) {
@@ -819,7 +813,7 @@ impl QemuInner {
             self.id.as_str(),
         ]
         .join("/");
-        vm_cleanup(&self.config, vm_path.as_str())
+        vm_cleanup(&self.config, &self.id, vm_path.as_str())
     }
 
     pub(crate) async fn resize_vcpu(
@@ -914,7 +908,8 @@ impl QemuInner {
     }
 
     pub(crate) async fn get_hypervisor_metrics(&self) -> Result<String> {
-        todo!()
+        warn!(sl!(), "Get Hypervisor Metrics: Not implemented");
+        Ok(String::new())
     }
 
     pub(crate) fn set_capabilities(&mut self, flag: CapabilityBits) {
@@ -1690,6 +1685,16 @@ mod tests {
     fn test_memlock_limit_adds_headroom() {
         assert_eq!(memlock_limit_with_headroom(10 * 1024), 11 * 1024);
         assert_eq!(memlock_limit_with_headroom(u64::MAX), u64::MAX);
+    }
+
+    #[tokio::test]
+    async fn test_unsupported_hypervisor_metrics_are_empty() {
+        let (exit_notify, _exit_waiter) = mpsc::channel(1);
+        let qemu = QemuInner::new(exit_notify);
+
+        for _ in 0..3 {
+            assert_eq!(qemu.get_hypervisor_metrics().await.unwrap(), "");
+        }
     }
 
     #[rstest]
