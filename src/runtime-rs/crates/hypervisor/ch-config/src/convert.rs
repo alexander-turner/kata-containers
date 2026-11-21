@@ -223,6 +223,12 @@ impl TryFrom<MemoryInfo> for MemoryConfig {
 
             prefault: mem.enable_mem_prealloc,
 
+            // Cloud Hypervisor reads an absent `thp` as true and marks guest RAM
+            // MADV_HUGEPAGE. With `defrag = madvise` on the host, a fault in such a
+            // region can wait on direct compaction, which stalls the boot when host
+            // memory is fragmented. Ask for 4 KiB host pages explicitly.
+            thp: false,
+
             ..Default::default()
         };
 
