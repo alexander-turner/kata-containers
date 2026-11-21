@@ -152,7 +152,7 @@ impl HookStates {
             .limit_time(Duration::from_secs(executor.timeout))
             .read_string();
 
-        match communicate_result {
+        let stderr = match communicate_result {
             Err(ref e) if e.kind() == io::ErrorKind::TimedOut => {
                 error!(sl!(), "hook poll failed, kill it");
                 let _ = job.kill();
@@ -164,17 +164,21 @@ impl HookStates {
                     "communicate hook {hook:?}: {e}"
                 )));
             }
-            Ok((ref stdout, ref stderr)) => {
+            Ok((stdout, stderr)) => {
                 if !stderr.is_empty() {
                     error!(sl!(), "hook {} stderr: {}", hook.path().display(), stderr);
                 }
                 if !stdout.is_empty() {
                     info!(sl!(), "hook {} stdout: {}", hook.path().display(), stdout);
                 }
+                stderr
             }
-        }
+        };
 
-        executor.wait_and_check(&mut job)?;
+        // A hook that refuses says why on its stderr, so the error carries it to the caller.
+        executor
+            .wait_and_check(&mut job)
+            .map_err(|e| with_stderr(e, &stderr))?;
         info!(sl!(), "hook {} finished", hook.path().display());
         self.states.insert(hook.into(), HookState::Done);
 
@@ -205,6 +209,15 @@ impl HookStates {
 
         Ok(())
     }
+}
+
+/// ERR, with the hook's STDERR appended when it wrote any.
+fn with_stderr(err: io::Error, stderr: &str) -> io::Error {
+    let stderr = stderr.trim();
+    if stderr.is_empty() {
+        return err;
+    }
+    io::Error::new(err.kind(), format!("{err}: {stderr}"))
 }
 
 struct HookExecutor<'a> {
@@ -597,5 +610,41 @@ echo -n "K1=${{K1}}" > {data_path}
         assert!((6..8u64).contains(&used));
         assert_eq!(ret.kind(), io::ErrorKind::TimedOut);
         assert!(states.should_retry());
+    }
+
+    #[test]
+    fn test_failed_hook_error_carries_its_stderr() {
+        let mut states = HookStates::new();
+        let hook = Hook {
+            path: "/bin/sh".to_string(),
+            args: vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                "echo 'refused: held-by-another-pod' >&2; exit 3".to_string(),
+            ],
+            env: vec![],
+            timeout: Some(5),
+        };
+        let oci_hook = hook.build_oci_hook();
+        let err = states.execute_hook(&oci_hook, None).unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("exit status with 3"), "{}", message);
+        assert!(
+            message.ends_with(": refused: held-by-another-pod"),
+            "{}",
+            message
+        );
+        assert!(states.should_retry());
+
+        let silent = Hook {
+            path: "/bin/sh".to_string(),
+            args: vec!["sh".to_string(), "-c".to_string(), "exit 4".to_string()],
+            env: vec![],
+            timeout: Some(5),
+        };
+        let err = states
+            .execute_hook(&silent.build_oci_hook(), None)
+            .unwrap_err();
+        assert!(err.to_string().ends_with("exit status with 4"), "{}", err);
     }
 }
