@@ -1052,6 +1052,12 @@ pub struct MemoryInfo {
     #[serde(default)]
     pub memory_slots: u32,
 
+    /// Set by the runtime, never read from a configuration file: the VM is sized
+    /// once at boot and memory is never hot-added, so the hypervisor reserves
+    /// no hotplug region. `static_sandbox_resource_mgmt` sets it.
+    #[serde(skip)]
+    pub no_memory_hotplug: bool,
+
     /// Pre-allocate VM RAM (reduces container density).
     #[serde(default)]
     pub enable_mem_prealloc: bool,

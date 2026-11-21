@@ -200,18 +200,24 @@ impl TryFrom<MemoryInfo> for MemoryConfig {
             return Err(MemoryConfigError::DefaultMemSizeTooBig);
         }
 
-        // The amount of memory that can be hot-plugged is the total less the
-        // amount allocated at VM start.
-        let hotplug_size_bytes = max_mem_bytes
-            .checked_sub(mem_bytes)
-            .ok_or(())
-            .map_err(|_| MemoryConfigError::BadMemSizeForHotplug(max_mem_bytes))?;
-
-        let hotplug_size = Some(
-            checked_next_multiple_of(hotplug_size_bytes, PMEM_ALIGN_BYTES)
+        // Any hotplug size makes Cloud Hypervisor attach its ACPI memory-hotplug
+        // device to the guest, so a VM that never hot-adds memory asks for none.
+        let hotplug_size = if mem.no_memory_hotplug {
+            None
+        } else {
+            // The amount of memory that can be hot-plugged is the total less the
+            // amount allocated at VM start.
+            let hotplug_size_bytes = max_mem_bytes
+                .checked_sub(mem_bytes)
                 .ok_or(())
-                .map_err(|_| MemoryConfigError::BadPmemAlign(hotplug_size_bytes))?,
-        );
+                .map_err(|_| MemoryConfigError::BadMemSizeForHotplug(max_mem_bytes))?;
+
+            Some(
+                checked_next_multiple_of(hotplug_size_bytes, PMEM_ALIGN_BYTES)
+                    .ok_or(())
+                    .map_err(|_| MemoryConfigError::BadPmemAlign(hotplug_size_bytes))?,
+            )
+        };
 
         let cfg = MemoryConfig {
             size: mem_bytes,
@@ -1257,6 +1263,22 @@ mod tests {
                     ..Default::default()
                 }),
             },
+            // A VM sized once at boot asks for no hotplug region.
+            TestData {
+                mem_info: MemoryInfo {
+                    default_memory: 1024,
+                    no_memory_hotplug: true,
+
+                    ..Default::default()
+                },
+                result: Ok(MemoryConfig {
+                    size: 1024_u64 * MIB,
+                    shared: true,
+                    hotplug_size: None,
+
+                    ..Default::default()
+                }),
+            },
             TestData {
                 mem_info: mem_info_std,
                 result: Ok(mem_cfg_std),
@@ -1284,6 +1306,26 @@ mod tests {
             assert!(result.is_ok(), "{}", msg);
             assert_eq!(&result.unwrap(), d.result.as_ref().unwrap(), "{}", msg);
         }
+    }
+
+    // Cloud Hypervisor attaches its memory-hotplug device to the guest whenever the
+    // request carries a `hotplug_size`, so a VM that never hot-adds memory sends none.
+    #[test]
+    fn test_no_memory_hotplug_sends_no_hotplug_size() {
+        let memory_config = |no_memory_hotplug| {
+            let mem_info = MemoryInfo {
+                default_memory: 1024,
+                no_memory_hotplug,
+
+                ..Default::default()
+            };
+            let cfg = MemoryConfig::try_from(mem_info).unwrap();
+
+            serde_json::to_value(cfg).unwrap()
+        };
+
+        assert!(memory_config(true).get("hotplug_size").is_none());
+        assert!(memory_config(false)["hotplug_size"].as_u64().unwrap() > 0);
     }
 
     #[test]
