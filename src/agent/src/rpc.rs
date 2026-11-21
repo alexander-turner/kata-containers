@@ -2222,9 +2222,12 @@ async fn remove_container_resources(sandbox: &mut Sandbox, cid: &str) -> Result<
 fn append_guest_hooks(s: &Sandbox, oci: &mut Spec) -> Result<()> {
     if let Some(ref guest_hooks) = s.hooks {
         if let Some(hooks) = oci.hooks_mut() {
-            util::merge(hooks.poststart_mut(), guest_hooks.prestart());
-            util::merge(hooks.poststart_mut(), guest_hooks.poststart());
-            util::merge(hooks.poststop_mut(), guest_hooks.poststop());
+            let prestart = util::merge(hooks.prestart_mut(), guest_hooks.prestart());
+            hooks.set_prestart(prestart);
+            let poststart = util::merge(hooks.poststart_mut(), guest_hooks.poststart());
+            hooks.set_poststart(poststart);
+            let poststop = util::merge(hooks.poststop_mut(), guest_hooks.poststop());
+            hooks.set_poststop(poststop);
         } else {
             let _oci_hooks = oci.set_hooks(Some(Hooks::default()));
             if let Some(hooks) = oci.hooks_mut() {
@@ -3099,6 +3102,47 @@ mod tests {
         let mut oci = Spec::default();
         append_guest_hooks(&s, &mut oci).unwrap();
         assert_eq!(s.hooks, oci.hooks().clone());
+    }
+
+    #[tokio::test]
+    async fn test_append_guest_hooks_to_a_spec_with_hooks() {
+        let logger = slog::Logger::root(slog::Discard, o!());
+        let mut s = Sandbox::new(&logger).unwrap();
+        let hook = |path: &str| {
+            HookBuilder::default()
+                .path(PathBuf::from(path))
+                .build()
+                .unwrap()
+        };
+        s.hooks = Some(
+            HooksBuilder::default()
+                .prestart(vec![hook("guest-prestart")])
+                .poststop(vec![hook("guest-poststop")])
+                .build()
+                .unwrap(),
+        );
+
+        let mut oci = Spec::default();
+        oci.set_hooks(Some(
+            HooksBuilder::default()
+                .start_container(vec![hook("spec-start")])
+                .poststop(vec![hook("spec-poststop")])
+                .build()
+                .unwrap(),
+        ));
+        append_guest_hooks(&s, &mut oci).unwrap();
+
+        let hooks = oci.hooks().clone().unwrap();
+        assert_eq!(hooks.prestart().clone(), Some(vec![hook("guest-prestart")]));
+        assert_eq!(hooks.poststart().clone(), None);
+        assert_eq!(
+            hooks.poststop().clone(),
+            Some(vec![hook("spec-poststop"), hook("guest-poststop")])
+        );
+        assert_eq!(
+            hooks.start_container().clone(),
+            Some(vec![hook("spec-start")])
+        );
     }
 
     #[tokio::test]
