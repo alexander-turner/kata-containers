@@ -172,6 +172,10 @@ impl InitialSizeManager {
             return Ok(());
         }
 
+        // update_linux_resource never resizes memory in static mode, so the
+        // hypervisor needs no room for hotplug.
+        hv.memory_info.no_memory_hotplug = true;
+
         if self.resource.vcpu > 0.0 || self.resource.mem_mb > 0 {
             if self.resource.vcpu > 0.0 {
                 info!(sl!(), "resource with vcpu {}", self.resource.vcpu);
@@ -479,6 +483,7 @@ mod tests {
         let hv = config.hypervisor.get("qemu").unwrap();
         assert_eq!(hv.cpu_info.default_vcpus, 1.7);
         assert_eq!(hv.memory_info.default_memory, 640);
+        assert!(hv.memory_info.no_memory_hotplug);
     }
 
     #[test]
@@ -496,6 +501,7 @@ mod tests {
         let hv = config.hypervisor.get("qemu").unwrap();
         assert_eq!(hv.cpu_info.default_vcpus, 1.0);
         assert_eq!(hv.memory_info.default_memory, 256);
+        assert!(!hv.memory_info.no_memory_hotplug);
     }
 
     #[test]
