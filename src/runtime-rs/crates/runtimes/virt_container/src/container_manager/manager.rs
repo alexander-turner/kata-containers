@@ -126,9 +126,16 @@ impl ContainerManager for VirtContainerManager {
         {
             let _netns_guard = NetnsGuard::new(&vmm_netns_path).context("vmm netns guard")?;
             if let Some(hooks) = spec.hooks().as_ref() {
+                // A createContainer hook that fails fails the create, as the OCI runtime spec
+                // asks, before the container's rootfs or volumes reach the VM.
                 let mut create_container_hook_states = HookStates::new();
-                create_container_hook_states
-                    .execute_hooks(from_hooks(hooks.create_container()), Some(state))?;
+                for hook in from_hooks(hooks.create_container()) {
+                    create_container_hook_states
+                        .execute_hook(hook, Some(state.clone()))
+                        .with_context(|| {
+                            format!("createContainer hook {}", hook.path().display())
+                        })?;
+                }
             }
         }
 
