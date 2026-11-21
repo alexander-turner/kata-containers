@@ -6,6 +6,7 @@
 
 use std::{
     collections::HashSet,
+    path::Path,
     sync::{
         atomic::{AtomicU32, Ordering},
         Arc,
@@ -18,7 +19,6 @@ use async_trait::async_trait;
 use futures::stream::TryStreamExt;
 use hypervisor::{device::device_manager::DeviceManager, Hypervisor};
 use kata_sys_util::netns;
-use netns_rs::get_from_path;
 use scopeguard::defer;
 use tokio::sync::{Mutex, RwLock};
 
@@ -320,8 +320,10 @@ impl Network for NetworkWithNetns {
             return Ok(());
         }
         if !cleanup.netns_unmounted {
-            let netns = get_from_path(inner.netns_path.clone())?;
-            netns.remove()?;
+            // get_from_path sets no Env, and NetNs::remove unmounts only a path inside
+            // its Env, so it leaves this bind mount standing and the file busy.
+            netns::remove_netns(Path::new(&inner.netns_path))
+                .context("remove the network namespace the shim created")?;
             cleanup.netns_unmounted = true;
         }
         if !cleanup.path_removed {

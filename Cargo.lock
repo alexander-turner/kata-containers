@@ -6241,7 +6241,6 @@ dependencies = [
  "logging",
  "netlink-packet-core",
  "netlink-packet-route",
- "netns-rs",
  "nix 0.31.3",
  "oci-spec 0.10.0",
  "persist",
