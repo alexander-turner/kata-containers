@@ -46,6 +46,9 @@ pub struct Process {
     // will continuously receive the HUP event. This can be problematic.
     // To avoid this problem, we open stdin in write mode and keep the stdin-writer
     pub stdin_w: Option<File>,
+    // Set by close_io. A CloseIO can arrive before start_io_and_wait opens stdin_w, and a
+    // keeper opened after it is never dropped, so the stdin copy would never see EOF.
+    pub stdin_closed: bool,
     // We need to open the stdout as the read mode and keep the open endpoint
     // until the process is delete. otherwise,
     // the process would exit before the containerd side open and read
@@ -120,6 +123,7 @@ impl Process {
             stdout,
             stderr,
             stdin_w: None,
+            stdin_closed: false,
             stdout_r: None,
             stderr_r: None,
             terminal,
@@ -153,7 +157,9 @@ impl Process {
 
     pub fn post_fifos_open(&mut self) -> Result<()> {
         if let Some(ref stdin) = self.stdin {
-            self.stdin_w = Some(open_fifo_write(stdin)?);
+            if !self.stdin_closed {
+                self.stdin_w = Some(open_fifo_write(stdin)?);
+            }
         }
         Ok(())
     }
@@ -273,8 +279,15 @@ impl Process {
         .context("new shim io")?;
         self.post_fifos_open()?;
 
-        // start io copy for stdin
-        if let Some(stdin) = shim_io.stdin {
+        // start io copy for stdin. A process with no terminal and no stdin stream copies an
+        // empty one, so the agent's stdin pipe for it reads EOF, as /dev/null does under runc.
+        // A terminal process with no stdin stream keeps its stdin: closing it closes the console.
+        let stdin: Option<Box<dyn AsyncRead + Send + Unpin>> = match shim_io.stdin {
+            Some(stdin) => Some(stdin),
+            None if !self.terminal => Some(Box::new(tokio::io::empty())),
+            None => None,
+        };
+        if let Some(stdin) = stdin {
             self.run_io_copy(StdIoType::Stdin, None, stdin, container_io.stdin)
                 .await?;
         }
@@ -333,22 +346,23 @@ impl Process {
                         logger,
                         "run_io_copy[{}]: stop to copy stream length {}", io_name, length
                     );
-                    // Send EOF to agent by calling rpc write_stdin with 0 length data
-                    if io_type == StdIoType::Stdin {
-                        writer
-                            .shutdown()
-                            .await
-                            .map_err(|e| {
-                                error!(
-                                    logger,
-                                    "run_io_copy[{}]: failed to shutdown: {:?}", io_name, e
-                                );
-                                e
-                            })
-                            .ok();
-                    }
                 }
             };
+            // Send EOF to agent by calling rpc write_stdin with 0 length data. A failed copy
+            // sends it too: the agent closes the process's stdin pipe on nothing else.
+            if io_type == StdIoType::Stdin {
+                writer
+                    .shutdown()
+                    .await
+                    .map_err(|e| {
+                        error!(
+                            logger,
+                            "run_io_copy[{}]: failed to shutdown: {:?}", io_name, e
+                        );
+                        e
+                    })
+                    .ok();
+            }
 
             // Close the destination before notifying the waiter. Binary
             // loggers must see pipe EOF before their shutdown signal.
@@ -468,6 +482,7 @@ impl Process {
     pub async fn close_io(&mut self, _agent: Arc<dyn Agent>) {
         // Close the stdin writer keeper so that
         // the end signal could be received in the read side
+        self.stdin_closed = true;
         self.stdin_w.take();
 
         // The stdin will be closed when EOF is got in rpc `read_stdout` of agent
