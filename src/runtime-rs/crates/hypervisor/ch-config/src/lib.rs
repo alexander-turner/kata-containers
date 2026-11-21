@@ -254,6 +254,9 @@ pub struct MemoryConfig {
     pub hugepage_size: Option<u64>,
     #[serde(default)]
     pub prefault: bool,
+    // Always serialized: Cloud Hypervisor reads an absent `thp` as true.
+    #[serde(default)]
+    pub thp: bool,
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub zones: Option<Vec<MemoryZoneConfig>>,
@@ -660,5 +663,12 @@ mod tests {
                 })
             );
         }
+    }
+
+    #[test]
+    fn test_memory_config_serializes_thp_off() {
+        let value = serde_json::to_value(MemoryConfig::default()).unwrap();
+
+        assert_eq!(value["thp"], serde_json::json!(false));
     }
 }
