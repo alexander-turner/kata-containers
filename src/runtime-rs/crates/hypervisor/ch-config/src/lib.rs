@@ -329,6 +329,17 @@ pub struct NetConfig {
     #[serde(default)]
     #[serde(skip_serializing_if = "u16_is_zero")]
     pub pci_segment: u16,
+    // A reply without these keys, such as vm.info, reads them as on rather than failing.
+    #[serde(default = "default_true")]
+    pub offload_tso: bool,
+    #[serde(default = "default_true")]
+    pub offload_ufo: bool,
+    #[serde(default = "default_true")]
+    pub offload_csum: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Default for NetConfig {
@@ -350,6 +361,10 @@ impl Default for NetConfig {
             fds: None,
             rate_limiter_config: None,
             pci_segment: 0,
+            // Cloud Hypervisor defaults the guest offloads off since v54.0; send them on.
+            offload_tso: true,
+            offload_ufo: true,
+            offload_csum: true,
         }
     }
 }
@@ -660,5 +675,34 @@ mod tests {
                 })
             );
         }
+    }
+
+    #[test]
+    fn test_net_config_sends_offloads_on() {
+        let net = serde_json::to_value(NetConfig::default()).unwrap();
+
+        assert_eq!(net["offload_tso"], serde_json::json!(true));
+        assert_eq!(net["offload_ufo"], serde_json::json!(true));
+        assert_eq!(net["offload_csum"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn test_net_config_reads_absent_offloads_as_on() {
+        let mut json = serde_json::to_value(NetConfig {
+            num_queues: 2,
+            queue_size: 256,
+            ..Default::default()
+        })
+        .unwrap();
+        let fields = json.as_object_mut().unwrap();
+        for key in ["offload_tso", "offload_ufo", "offload_csum"] {
+            assert!(fields.remove(key).is_some());
+        }
+
+        let net: NetConfig = serde_json::from_value(json).unwrap();
+
+        assert!(net.offload_tso);
+        assert!(net.offload_ufo);
+        assert!(net.offload_csum);
     }
 }
